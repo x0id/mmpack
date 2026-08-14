@@ -10,6 +10,7 @@
 
 #include "mmpack/detail/bits.hpp"
 #include "mmpack/error.hpp"
+#include "mmpack/format.hpp"
 
 // The schema is the whole point of this library: record shape is data, not a C++
 // type, so it is computed from the input and written into the image.
@@ -74,8 +75,15 @@ struct schema_header {
   std::uint8_t mode;             ///< value_mode
   std::uint8_t ref_width;        ///< interned only: 1, 2, 4 or 8
   std::uint32_t value_dict;      ///< interned only: index into the dict table
+  // How the partition directory is packed. It lives here rather than in the
+  // footer because this block is already the layout descriptor, and because the
+  // reader parses it before it touches the directory.
+  std::uint8_t dir_partition_width;  ///< 0 = implicit: slot i describes partition i
+  std::uint8_t dir_offset_width;
+  std::uint8_t dir_count_width;
+  std::uint8_t dir_remap_width;      ///< 0 when no partition is remapped
 };
-static_assert(sizeof(schema_header) == 32, "schema_header must be padding-free");
+static_assert(sizeof(schema_header) == 36, "schema_header must be padding-free");
 
 struct field_desc {
   std::uint32_t offset;       ///< byte offset within the value tuple
@@ -179,6 +187,18 @@ class schema_view {
 
     if (!detail::is_valid_width(head.address_width)) return std::nullopt;
     if (head.address_bits > 64) return std::nullopt;
+
+    // The directory widths gate every later bounds check, so they are validated
+    // before anything is sized from them. A zero partition width is legal and
+    // means the directory is dense; zero offset or count width never is.
+    if (head.dir_partition_width != 0 && !detail::is_valid_width(head.dir_partition_width)) {
+      return std::nullopt;
+    }
+    if (!detail::is_valid_width(head.dir_offset_width)) return std::nullopt;
+    if (!detail::is_valid_width(head.dir_count_width)) return std::nullopt;
+    if (head.dir_remap_width != 0 && !detail::is_valid_width(head.dir_remap_width)) {
+      return std::nullopt;
+    }
     if (head.mode > static_cast<std::uint8_t>(value_mode::interned)) return std::nullopt;
     if (head.value_stride == 0 && head.field_count != 0) return std::nullopt;
 
@@ -255,6 +275,14 @@ class schema_view {
   [[nodiscard]] std::uint32_t value_dict() const noexcept { return head_.value_dict; }
   [[nodiscard]] value_mode mode() const noexcept { return static_cast<value_mode>(head_.mode); }
   [[nodiscard]] bool interned() const noexcept { return mode() == value_mode::interned; }
+
+  /// How to unpack a directory slot. schema_id is only stored when some
+  /// partition is remapped, which is exactly when a remap width is present.
+  [[nodiscard]] dir_layout directory_layout() const noexcept {
+    const unsigned schema_width = head_.dir_remap_width != 0 ? 1u : 0u;
+    return make_dir_layout(head_.dir_partition_width, head_.dir_offset_width,
+                           head_.dir_count_width, schema_width, head_.dir_remap_width);
+  }
 
   [[nodiscard]] field_desc field(field_id id) const noexcept {
     return detail::load<field_desc>(fields_ + static_cast<std::size_t>(id) * sizeof(field_desc));

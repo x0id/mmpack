@@ -85,6 +85,8 @@ struct build_report {
   /// Partitions given a local remap table, and the record bytes that saved.
   std::uint64_t remapped_partitions = 0;
   std::uint64_t remap_saved_bytes = 0;
+  /// Packed bytes per directory slot, once every field is narrowed to its range.
+  std::uint32_t directory_stride = 0;
   /// Record-and-dictionary bytes each layout would have cost, for auditing.
   std::uint64_t inline_estimate = 0;
   std::uint64_t interned_estimate = 0;
@@ -594,25 +596,40 @@ class table_builder {
     pad_to(8);
     const std::uint64_t dir_offset = pos;
     const bool dense = use_dense(directory);
+
+    // Narrow every directory field to what this image actually needs. A dense
+    // directory drops the partition entirely: slot i describes partition i, so
+    // storing it would only be a value to check against its own index.
+    std::uint64_t max_partition = 0, max_offset = 0, max_count = 0, max_remap = 0;
+    for (const dir_entry& d : directory) {
+      max_partition = std::max(max_partition, d.partition);
+      max_offset = std::max(max_offset, d.offset);
+      max_count = std::max(max_count, d.count);
+      max_remap = std::max<std::uint64_t>(max_remap, d.remap_count);
+    }
+    dir_ = make_dir_layout(dense ? 0u : detail::width_for(max_partition),
+                           detail::width_for(max_offset), detail::width_for(max_count),
+                           max_remap != 0 ? 1u : 0u,
+                           max_remap != 0 ? detail::width_for(max_remap) : 0u);
+
+    std::vector<std::byte> slot(dir_.stride);
     std::uint64_t dir_count = 0;
+    const auto emit_slot = [&](const dir_entry& d) {
+      encode_dir_entry(slot.data(), dir_, d);
+      emit(slot.data(), slot.size());
+      ++dir_count;
+    };
     if (dense) {
       std::uint64_t next = 0;
       for (const dir_entry& d : directory) {
-        for (; next < d.partition; ++next) {
-          const dir_entry hole{next, 0, 0, 0, 0};
-          emit(&hole, sizeof(hole));
-          ++dir_count;
-        }
-        emit(&d, sizeof(d));
-        ++dir_count;
+        for (; next < d.partition; ++next) emit_slot(dir_entry{next, 0, 0, 0, 0});
+        emit_slot(d);
         next = d.partition + 1;
       }
     } else {
-      for (const dir_entry& d : directory) {
-        emit(&d, sizeof(d));
-        ++dir_count;
-      }
+      for (const dir_entry& d : directory) emit_slot(d);
     }
+    report.directory_stride = dir_.stride;
 
     pad_to(8);
     const std::uint64_t schema_offset = pos;
@@ -659,6 +676,10 @@ class table_builder {
                                                     : value_mode::inline_fields);
     head.ref_width = static_cast<std::uint8_t>(interned_ ? ref_width_ : 0);
     head.value_dict = interned_ ? value_dict_index : 0;
+    head.dir_partition_width = static_cast<std::uint8_t>(dir_.partition_width);
+    head.dir_offset_width = static_cast<std::uint8_t>(dir_.offset_width);
+    head.dir_count_width = static_cast<std::uint8_t>(dir_.count_width);
+    head.dir_remap_width = static_cast<std::uint8_t>(dir_.remap_width);
 
     emit(&head, sizeof(head));
     if (!out.empty()) emit(out.data(), out.size() * sizeof(field_desc));
@@ -682,6 +703,7 @@ class table_builder {
   std::vector<blob_dictionary_builder> text_dicts_;
   std::unordered_set<std::uint64_t, tuple_hash, tuple_equal> index_;
   std::vector<field_desc> descs_;
+  dir_layout dir_;  ///< settled once the directory's value ranges are known
 
   std::uint64_t count_ = 0;
   std::uint64_t last_key_ = 0;

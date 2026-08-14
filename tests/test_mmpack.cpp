@@ -101,6 +101,34 @@ std::unique_ptr<built> build(const std::vector<row>& rows, mmpack::build_options
   return out;
 }
 
+/// Reading and rewriting directory slots of a built image. The directory is
+/// packed at data-derived widths, so tests cannot treat it as an array of
+/// structs; they have to go through the same layout the reader uses.
+struct dir_access {
+  mmpack::footer foot{};
+  mmpack::dir_layout layout{};
+};
+
+dir_access open_directory(const std::vector<std::byte>& image) {
+  const auto t = mmpack::table::open(image.data(), image.size());
+  dir_access out;
+  out.foot =
+      mmpack::detail::load<mmpack::footer>(image.data() + image.size() - sizeof(mmpack::footer));
+  out.layout = t.schema().directory_layout();
+  return out;
+}
+
+mmpack::dir_entry get_slot(const std::vector<std::byte>& image, const dir_access& a,
+                           std::uint64_t i) {
+  return mmpack::decode_dir_entry(image.data() + a.foot.dir_offset + i * a.layout.stride, a.layout,
+                                  i);
+}
+
+void put_slot(std::vector<std::byte>& image, const dir_access& a, std::uint64_t i,
+              const mmpack::dir_entry& d) {
+  mmpack::encode_dir_entry(image.data() + a.foot.dir_offset + i * a.layout.stride, a.layout, d);
+}
+
 /// Every row resolves back to exactly what went in.
 void verify_contents(const mmpack::table& t, const built& b, const std::vector<row>& rows) {
   for (const row& r : rows) {
@@ -916,6 +944,74 @@ void test_partition_remap_is_selective() {
   }
 }
 
+void test_directory_is_narrowed() {
+  {  // Dense: the partition is implicit, so it costs nothing at all.
+    auto [sink, report] = build_remap_case(true, 60, 100, 5);
+    const auto t = mmpack::table::open(sink->data(), sink->size());
+    CHECK(t.has_dense_directory());
+    const auto layout = t.schema().directory_layout();
+    CHECK(layout.partition_width == 0);
+    CHECK(layout.schema_width == 1);   // some partition is remapped
+    CHECK(layout.remap_width >= 1);
+    CHECK(layout.stride == report.directory_stride);
+    CHECK(layout.stride < sizeof(mmpack::dir_entry));
+    // offset + count + schema_id + remap_count, all narrowed.
+    CHECK(layout.stride <= 12);
+
+    // Every slot still decodes to the right partition and record count.
+    std::uint64_t seen = 0;
+    for (std::uint64_t i = 0; i < t.directory_slots(); ++i) seen += 1;
+    CHECK(seen == t.directory_slots());
+    for (std::uint64_t p = 0; p < 60; ++p) {
+      CHECK(t.find((p << 8) | 0) != t.end());
+    }
+  }
+  {  // Sparse: the partition is stored, but only as wide as it needs to be.
+    mmpack::schema_builder sb;
+    const auto f = sb.add_uint("v");
+    mmpack::vector_sink sink;
+    mmpack::build_options o;
+    o.address_bits = 8;
+    mmpack::table_builder tb(sb, o);
+    for (std::uint64_t p : {0ull, 1ull, 1ull << 30}) {
+      auto rec = tb.begin_record((p << 8) | 1);
+      rec.set_uint(f, p);
+      tb.commit(rec);
+    }
+    const auto report = tb.finish(sink);
+    const auto t = mmpack::table::open(sink.data(), sink.size());
+    CHECK(!t.has_dense_directory());
+    const auto layout = t.schema().directory_layout();
+    CHECK(layout.partition_width == 4);  // 2^30 needs four bytes, not eight
+    CHECK(layout.schema_width == 0);     // nothing remapped here
+    CHECK(layout.remap_width == 0);
+    CHECK(layout.stride == report.directory_stride);
+    CHECK(layout.stride < sizeof(mmpack::dir_entry));
+    for (std::uint64_t p : {0ull, 1ull, 1ull << 30}) {
+      const auto it = t.find((p << 8) | 1);
+      CHECK(it != t.end());
+      if (it != t.end()) CHECK(t.uint(it, f).value() == p);
+    }
+  }
+  {  // A tiny image should land on the narrowest widths available.
+    mmpack::schema_builder sb;
+    const auto f = sb.add_uint("v");
+    mmpack::vector_sink sink;
+    mmpack::table_builder tb(sb, {});
+    for (std::uint64_t i = 0; i < 5; ++i) {
+      auto rec = tb.begin_record(i);
+      rec.set_uint(f, i);
+      tb.commit(rec);
+    }
+    const auto report = tb.finish(sink);
+    const auto t = mmpack::table::open(sink.data(), sink.size());
+    const auto layout = t.schema().directory_layout();
+    CHECK(layout.offset_width == 1);  // everything lives in the first 256 bytes
+    CHECK(layout.count_width == 1);
+    CHECK(report.directory_stride <= 3);
+  }
+}
+
 void test_remap_corruption() {
   // 60 partitions x 5 distinct = 300 global tuples, so the global reference is
   // 2 bytes and a 1-byte local index is genuinely narrower. Fewer partitions
@@ -925,60 +1021,51 @@ void test_remap_corruption() {
   CHECK(report.remapped_partitions == 60);
   const auto& image = sink->bytes();
   mmpack::status s = mmpack::status::ok;
-
-  const auto footer_of = [](const std::vector<std::byte>& img) {
-    return mmpack::detail::load<mmpack::footer>(img.data() + img.size() - sizeof(mmpack::footer));
-  };
-  const auto slot_of = [&](std::vector<std::byte>& img, std::uint64_t i) {
-    const auto f = footer_of(img);
-    return mmpack::detail::load<mmpack::dir_entry>(img.data() + f.dir_offset +
-                                                   i * sizeof(mmpack::dir_entry));
-  };
-  const auto put_slot = [&](std::vector<std::byte>& img, std::uint64_t i,
-                            const mmpack::dir_entry& d) {
-    const auto f = footer_of(img);
-    mmpack::detail::store(img.data() + f.dir_offset + i * sizeof(mmpack::dir_entry), d);
-  };
+  const dir_access acc = open_directory(image);
+  CHECK(acc.layout.schema_width == 1);  // remapped images carry the field
+  CHECK(acc.layout.remap_width >= 1);
 
   {  // an impossible local reference width
     auto corrupt = image;
-    auto d = slot_of(corrupt, 0);
+    auto d = get_slot(corrupt, acc, 0);
     d.schema_id = 7;
-    put_slot(corrupt, 0, d);
+    put_slot(corrupt, acc, 0, d);
     CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
     CHECK(s == mmpack::status::bad_directory);
   }
   {  // remapped, but with no remap table to resolve through
     auto corrupt = image;
-    auto d = slot_of(corrupt, 0);
+    auto d = get_slot(corrupt, acc, 0);
     d.remap_count = 0;
-    put_slot(corrupt, 0, d);
+    put_slot(corrupt, acc, 0, d);
     CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
     CHECK(s == mmpack::status::bad_directory);
   }
-  {  // a remap table claiming more entries than the image can hold
+  {  // a remap table claiming more entries than the image can hold. The field is
+     // only as wide as the real tables needed, so the largest expressible value
+     // is what to push it to.
     auto corrupt = image;
-    auto d = slot_of(corrupt, 0);
-    d.remap_count = 1u << 30;
-    put_slot(corrupt, 0, d);
+    auto d = get_slot(corrupt, acc, 0);
+    d.remap_count =
+        static_cast<std::uint32_t>(mmpack::detail::max_for_width(acc.layout.remap_width));
+    put_slot(corrupt, acc, 0, d);
     CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
     CHECK(s == mmpack::status::bad_directory);
   }
   {  // a remap table on a partition that is not remapped
     auto corrupt = image;
-    auto d = slot_of(corrupt, 0);
+    auto d = get_slot(corrupt, acc, 0);
     d.schema_id = 0;
-    put_slot(corrupt, 0, d);  // remap_count stays non-zero
+    put_slot(corrupt, acc, 0, d);  // remap_count stays non-zero
     CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
     CHECK(s == mmpack::status::bad_directory);
   }
   {  // a local index past the end of its remap table must not read the records
      // that follow it -- this is the one that only fails at access time
     auto corrupt = image;
-    const auto d = slot_of(corrupt, 0);
+    const auto d = get_slot(corrupt, acc, 0);
     CHECK(d.schema_id == 1);
-    std::byte* records =
-        corrupt.data() + d.offset + d.remap_count * sizeof(std::uint32_t);
+    std::byte* records = corrupt.data() + d.offset + d.remap_count * sizeof(std::uint32_t);
     const auto t0 = mmpack::table::open(corrupt.data(), corrupt.size());
     const auto id = t0.field("v").value();
     CHECK(t0.uint(t0.begin(), id).has_value());  // fine before corruption
@@ -988,7 +1075,9 @@ void test_remap_corruption() {
     CHECK(!t1.uint(t1.begin(), id).has_value());
     CHECK(t1.begin().key() == 0);  // the key still reads: it lives in the record
   }
-  {  // remap declared on an image that is not interned at all
+  {  // An image with no remapped partition has no schema_id or remap_count field
+     // in its directory at all, so "remapped" is not merely rejected there -- it
+     // cannot be expressed.
     mmpack::schema_builder sb;
     const auto f = sb.add_uint("v");
     mmpack::vector_sink plain;
@@ -1000,15 +1089,22 @@ void test_remap_corruption() {
       rec.set_uint(f, i);
       tb.commit(rec);
     }
-    tb.finish(plain);
+    const auto rep = tb.finish(plain);
+    CHECK(rep.remapped_partitions == 0);
 
+    const dir_access plain_acc = open_directory(plain.bytes());
+    CHECK(plain_acc.layout.schema_width == 0);
+    CHECK(plain_acc.layout.remap_width == 0);
     auto corrupt = plain.bytes();
-    auto d = slot_of(corrupt, 0);
+    auto d = get_slot(corrupt, plain_acc, 0);
     d.schema_id = 1;
     d.remap_count = 4;
-    put_slot(corrupt, 0, d);
-    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
-    CHECK(s == mmpack::status::bad_directory);
+    put_slot(corrupt, plain_acc, 0, d);
+    // The write is a no-op for those two fields, so the image stays valid and
+    // still reads correctly rather than becoming a rejected one.
+    const auto t = mmpack::table::open(corrupt.data(), corrupt.size());
+    CHECK(t.size() == 50);
+    CHECK(t.uint(t.find(7), t.field("v").value()).value() == 7);
   }
 }
 
@@ -1068,12 +1164,39 @@ void test_rejects_bad_images() {
   }
   {  // a partition claiming more records than fit
     auto corrupt = image;
-    const auto f = load_footer(corrupt);
-    auto slot = mmpack::detail::load<mmpack::dir_entry>(corrupt.data() + f.dir_offset);
-    slot.count = 1ull << 40;
-    mmpack::detail::store(corrupt.data() + f.dir_offset, slot);
+    const dir_access acc = open_directory(corrupt);
+    auto slot = get_slot(corrupt, acc, 0);
+    slot.count = mmpack::detail::max_for_width(acc.layout.count_width);
+    put_slot(corrupt, acc, 0, slot);
     CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
     CHECK(s == mmpack::status::bad_directory);
+  }
+  {  // a partition whose records start outside the image
+    auto corrupt = image;
+    const dir_access acc = open_directory(corrupt);
+    auto slot = get_slot(corrupt, acc, 0);
+    slot.offset = mmpack::detail::max_for_width(acc.layout.offset_width);
+    put_slot(corrupt, acc, 0, slot);
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_directory);
+  }
+  {  // directory widths that disagree with the density flag
+    auto corrupt = image;
+    const auto f = load_footer(corrupt);
+    auto head = mmpack::detail::load<mmpack::schema_header>(corrupt.data() + f.schema_offset);
+    head.dir_partition_width = head.dir_partition_width == 0 ? 4 : 0;
+    mmpack::detail::store(corrupt.data() + f.schema_offset, head);
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_directory);
+  }
+  {  // an illegal directory field width
+    auto corrupt = image;
+    const auto f = load_footer(corrupt);
+    auto head = mmpack::detail::load<mmpack::schema_header>(corrupt.data() + f.schema_offset);
+    head.dir_count_width = 3;
+    mmpack::detail::store(corrupt.data() + f.schema_offset, head);
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_schema);
   }
   {  // a field reaching past the value tuple
     auto corrupt = image;
@@ -1156,14 +1279,19 @@ void test_corrupt_value_reference() {
   const auto b = build(rows, options);
 
   auto corrupt = b->sink.bytes();
-  const auto f =
-      mmpack::detail::load<mmpack::footer>(corrupt.data() + corrupt.size() - sizeof(mmpack::footer));
-  const auto slot = mmpack::detail::load<mmpack::dir_entry>(corrupt.data() + f.dir_offset);
-  const auto head = mmpack::detail::load<mmpack::schema_header>(corrupt.data() + f.schema_offset);
+  const dir_access acc = open_directory(corrupt);
+  const mmpack::dir_entry slot = get_slot(corrupt, acc, 0);
+  const auto head = mmpack::detail::load<mmpack::schema_header>(corrupt.data() +
+                                                                acc.foot.schema_offset);
 
   // Point the first record's value reference at a wildly out-of-range entry.
-  std::byte* ref = corrupt.data() + slot.offset + head.address_width;
-  for (unsigned i = 0; i < head.ref_width; ++i) ref[i] = std::byte{0xff};
+  // Records sit after the remap table when the partition has one, and the
+  // reference is local rather than global in that case -- either way, an
+  // all-ones reference must resolve to nothing.
+  const unsigned width = slot.schema_id != 0 ? slot.schema_id : head.ref_width;
+  std::byte* ref = corrupt.data() + slot.offset +
+                   slot.remap_count * sizeof(std::uint32_t) + head.address_width;
+  for (unsigned i = 0; i < width; ++i) ref[i] = std::byte{0xff};
 
   const auto t = mmpack::table::open(corrupt.data(), corrupt.size());
   const auto it = t.begin();
@@ -1218,6 +1346,7 @@ int main() {
   run("dedup give up", test_dedup_give_up);
   run("partition remap", test_partition_remap);
   run("partition remap is selective", test_partition_remap_is_selective);
+  run("directory is narrowed", test_directory_is_narrowed);
   run("remap corruption", test_remap_corruption);
   run("rejects bad images", test_rejects_bad_images);
   run("corrupt value reference", test_corrupt_value_reference);

@@ -71,6 +71,20 @@ inline void store_uint(std::byte* p, unsigned width, std::uint64_t v) noexcept {
   return 8;
 }
 
+/// Mask selecting the low `width` bytes.
+[[nodiscard]] constexpr std::uint64_t mask_for_width(unsigned width) noexcept {
+  return width >= 8 ? ~std::uint64_t{0} : (std::uint64_t{1} << (8 * width)) - 1;
+}
+
+/// Load a narrow unsigned field as one wide load plus a mask, with no branch on
+/// the width. Reads 8 bytes, so the caller must have proved that many are
+/// readable -- see table's directory accessors, where open() has already bounded
+/// the directory well clear of the image end.
+[[nodiscard]] inline std::uint64_t load_uint_masked(const std::byte* p,
+                                                    std::uint64_t mask) noexcept {
+  return load<std::uint64_t>(p) & mask;
+}
+
 /// Largest value representable in `width` bytes.
 [[nodiscard]] constexpr std::uint64_t max_for_width(unsigned width) noexcept {
   switch (width) {

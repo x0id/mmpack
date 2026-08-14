@@ -262,7 +262,22 @@ Record stride is fixed *within* a partition but may differ *between* them: a
 remapped partition prefixes its records with a table of global tuple ids and
 narrows its references accordingly. `dir_entry::schema_id` carries the local
 reference width (0 = global) and `remap_count` the table length, so the reader
-resolves the geometry from one directory load before the search starts.
+resolves the geometry before the search starts.
+
+**The directory itself is packed the same way the records are.** `dir_entry` is
+the decoded form, not the stored one: each field is narrowed to what the image
+needs, and a dense directory omits the partition entirely because slot *i*
+describes partition *i* by construction — storing it would only be a value to
+check against its own index. A geo-IP-shaped image lands on 5–7 bytes per slot
+against the 32 a struct would take, so seven slots share a cache line instead of
+two. The widths live in the schema block, which the reader parses before it
+touches the directory.
+
+Fields are read as one masked 8-byte load rather than a switch on the width,
+which is what keeps the packed form from costing more than it saves; `open()`
+proves the eight bytes are in range. Measured against the fixed-struct
+directory on 4.8M records: 32.07 → 30.99 MB and 84.0 → 82.8 ns without remap,
+22.39 → 21.39 MB and 67.7 → 63.8 ns with it.
 
 Lookup is two steps as ever: select the partition (O(1) when partition indices
 are dense, O(log P) when sparse), then binary search the fixed-stride records.

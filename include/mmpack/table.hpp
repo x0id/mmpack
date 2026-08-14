@@ -134,11 +134,21 @@ class table {
     t.ref_width_ = schema->ref_width();
 
     // --- directory ---
-    if (foot.dir_offset % alignof(dir_entry) != 0 || foot.dir_offset < sizeof(header) ||
-        foot.dir_offset > tail) {
+    t.dir_ = schema->directory_layout();
+    if (t.dir_.stride == 0) return fail(status::bad_directory);
+    // A dense directory is exactly the case where the partition is implicit, so
+    // the two encodings must not disagree about which one this is.
+    if ((t.dir_.partition_width == 0) != t.dense_) return fail(status::bad_directory);
+    if (foot.dir_offset < sizeof(header) || foot.dir_offset > tail) {
       return fail(status::bad_directory);
     }
-    if (foot.dir_count > (tail - foot.dir_offset) / sizeof(dir_entry)) {
+    if (foot.dir_count > (tail - foot.dir_offset) / t.dir_.stride) {
+      return fail(status::bad_directory);
+    }
+    // Directory fields are read with a masked 8-byte load, so the slack past the
+    // last slot has to be real. The footer alone guarantees it, but stating the
+    // requirement here keeps it from quietly lapsing if the layout moves.
+    if (foot.dir_offset + foot.dir_count * t.dir_.stride + sizeof(std::uint64_t) > length) {
       return fail(status::bad_directory);
     }
     t.directory_ = bytes + foot.dir_offset;
@@ -149,8 +159,9 @@ class table {
     std::uint64_t floor = sizeof(header);
     for (std::uint64_t i = 0; i < foot.dir_count; ++i) {
       const dir_entry d = t.slot(i);
+      // Density no longer needs checking: a dense directory does not store the
+      // partition at all, so slot i describes partition i by construction.
       if (i > 0 && d.partition <= previous) return fail(status::bad_directory);
-      if (t.dense_ && d.partition != i) return fail(status::bad_directory);
 
       // A remapped partition carries its own reference width and lookup table,
       // so its geometry has to be validated before it can be trusted to size
@@ -381,20 +392,27 @@ class table {
  private:
   friend class const_iterator;
 
-  [[nodiscard]] dir_entry slot(std::uint64_t i) const {
-    return detail::load<dir_entry>(directory_ + i * sizeof(dir_entry));
+  [[nodiscard]] const std::byte* slot_bytes(std::uint64_t i) const {
+    return directory_ + i * dir_.stride;
   }
+  [[nodiscard]] dir_entry slot(std::uint64_t i) const {
+    return decode_dir_entry(slot_bytes(i), dir_, i);
+  }
+  // Directory fields are read as one wide load plus a mask rather than a switch
+  // on the width. The 8-byte read is proven in bounds at open(): the directory
+  // ends at or before image_size - sizeof(footer), so eight bytes past its last
+  // byte still land inside the image.
+  //
+  /// A dense directory does not store the partition: slot i *is* partition i.
   [[nodiscard]] std::uint64_t slot_partition(std::uint64_t i) const {
-    return detail::load<std::uint64_t>(directory_ + i * sizeof(dir_entry) +
-                                       offsetof(dir_entry, partition));
+    if (dir_.partition_width == 0) return i;
+    return detail::load_uint_masked(slot_bytes(i) + dir_.partition_at, dir_.partition_mask);
   }
   [[nodiscard]] std::uint64_t slot_offset(std::uint64_t i) const {
-    return detail::load<std::uint64_t>(directory_ + i * sizeof(dir_entry) +
-                                       offsetof(dir_entry, offset));
+    return detail::load_uint_masked(slot_bytes(i) + dir_.offset_at, dir_.offset_mask);
   }
   [[nodiscard]] std::uint64_t slot_count(std::uint64_t i) const {
-    return detail::load<std::uint64_t>(directory_ + i * sizeof(dir_entry) +
-                                       offsetof(dir_entry, count));
+    return detail::load_uint_masked(slot_bytes(i) + dir_.count_at, dir_.count_mask);
   }
 
   /// Everything about one partition's byte layout, read from the directory in a
@@ -411,18 +429,28 @@ class table {
   };
 
   [[nodiscard]] partition_layout layout_of(std::uint64_t s) const {
-    const dir_entry d = slot(s);
+    const std::byte* p = slot_bytes(s);
+    const std::uint64_t offset = detail::load_uint_masked(p + dir_.offset_at, dir_.offset_mask);
+    const std::uint32_t schema_id =
+        dir_.schema_width != 0
+            ? static_cast<std::uint32_t>(
+                  detail::load_uint_masked(p + dir_.schema_at, dir_.schema_mask))
+            : 0;
+
     partition_layout out;
-    out.count = d.count;
-    out.remapped = d.schema_id != remap::none;
-    out.remap_count = d.remap_count;
-    out.ref_width = out.remapped ? d.schema_id : ref_width_;
-    out.stride = out.remapped ? address_width_ + d.schema_id : record_stride_;
-    out.remap = out.remapped ? base_ + d.offset : nullptr;
-    out.records = base_ + d.offset +
-                  (out.remapped
-                       ? static_cast<std::uint64_t>(d.remap_count) * sizeof(std::uint32_t)
-                       : 0);
+    out.count = detail::load_uint_masked(p + dir_.count_at, dir_.count_mask);
+    out.remapped = schema_id != remap::none;
+    out.remap_count =
+        dir_.remap_width != 0
+            ? static_cast<std::uint32_t>(
+                  detail::load_uint_masked(p + dir_.remap_at, dir_.remap_mask))
+            : 0;
+    out.ref_width = out.remapped ? schema_id : ref_width_;
+    out.stride = out.remapped ? address_width_ + schema_id : record_stride_;
+    out.remap = out.remapped ? base_ + offset : nullptr;
+    out.records =
+        base_ + offset +
+        (out.remapped ? static_cast<std::uint64_t>(out.remap_count) * sizeof(std::uint32_t) : 0);
     return out;
   }
 
@@ -613,6 +641,7 @@ class table {
   const std::byte* directory_ = nullptr;
   std::uint64_t dir_count_ = 0;
   std::uint64_t record_count_ = 0;
+  dir_layout dir_;
   std::vector<blob_dictionary_view> blob_dicts_;
   fixed_dictionary_view value_dict_;
   std::uint32_t record_stride_ = 0;
