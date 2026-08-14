@@ -50,13 +50,17 @@ std::vector<std::byte> valid_image(std::mt19937_64& rng, fields& ids,
   // Cover both value modes, since interned adds a whole indirection to attack.
   options.value_interning = (rng() % 2) ? mmpack::interning_policy::always
                                         : mmpack::interning_policy::never;
+  options.partition_remap = (rng() % 2) != 0;
 
   mmpack::table_builder tb(sb, options);
-  const int n = 1 + static_cast<int>(rng() % 400);
+  // Enough records and enough distinct tuples that the global reference is
+  // sometimes 2 bytes wide, which is what lets partitions actually remap.
+  const int n = 1 + static_cast<int>(rng() % 3000);
+  const unsigned tuple_space = 4 + static_cast<unsigned>(rng() % 400);
   std::uint64_t key = 0;
   for (int i = 0; i < n; ++i) {
     key += 1 + rng() % 40;
-    const unsigned t = static_cast<unsigned>(rng() % 12);
+    const unsigned t = static_cast<unsigned>(rng() % tuple_space);
     auto rec = tb.begin_record(key);
     rec.set_text(ids.country, countries[t % 5]);
     rec.set_text(ids.region, "region-" + std::to_string(t % 4));

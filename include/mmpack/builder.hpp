@@ -10,6 +10,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -52,6 +53,11 @@ struct build_options {
   unsigned address_bits = 32;
   interning_policy value_interning = interning_policy::automatic;
   input_order order = input_order::assume_sorted;
+  /// Give each partition its own table of the global tuple ids it actually uses,
+  /// so its records can carry a narrower local index. Only applies to interned
+  /// images, and only where it pays for the table. This is stride reduction on
+  /// the hot path, so it is on by default.
+  bool partition_remap = true;
   /// Round each field offset up to its own width. Off by default.
   bool align_fields = false;
   /// Stop deduplicating tuples once this many records have been seen and the
@@ -76,6 +82,9 @@ struct build_report {
   unsigned ref_width = 0;
   std::uint32_t value_stride = 0;
   std::uint32_t record_stride = 0;
+  /// Partitions given a local remap table, and the record bytes that saved.
+  std::uint64_t remapped_partitions = 0;
+  std::uint64_t remap_saved_bytes = 0;
   /// Record-and-dictionary bytes each layout would have cost, for auditing.
   std::uint64_t inline_estimate = 0;
   std::uint64_t interned_estimate = 0;
@@ -363,24 +372,43 @@ class table_builder {
     }
     value_stride_ = offset;
 
-    // Address width comes from the data too, not from address_bits.
+    const std::uint64_t distinct = tuple_count();
+    ref_width_ = detail::width_for(distinct == 0 ? 0 : distinct - 1);
+
+    // One walk over the staged records: the address width comes from the data
+    // rather than from address_bits, and per-partition distinct counts give the
+    // remap saving. Both are needed before the layout can be priced.
     std::uint64_t max_address = 0;
-    std::uint64_t max_partition = 0;
-    for (std::uint64_t i = 0; i < staging_->size(); ++i) {
-      const std::uint64_t key = staging_->key_at(i);
-      max_address = std::max(max_address, address_of(key));
-      max_partition = std::max(max_partition, partition_of(key));
+    std::uint64_t remap_savings = 0;
+    {
+      std::unordered_set<std::uint64_t> local;
+      const std::uint64_t n = staging_->size();
+      std::uint64_t i = 0;
+      while (i < n) {
+        const std::uint64_t partition = partition_of(staging_->key_at(i));
+        local.clear();
+        std::uint64_t j = i;
+        while (j < n && partition_of(staging_->key_at(j)) == partition) {
+          max_address = std::max(max_address, address_of(staging_->key_at(j)));
+          local.insert(staging_->tuple_at(j));
+          ++j;
+        }
+        std::uint64_t saved = 0;
+        (void)plan_remap(local.size(), j - i, saved);  // only the saving matters here
+        remap_savings += saved;
+        i = j;
+      }
     }
     address_width_ = detail::width_for(max_address);
-    (void)max_partition;
 
     // The cost model. Dictionary bytes for text fields are the same either way,
     // so they cancel and only records plus the composite dictionary matter.
-    const std::uint64_t distinct = tuple_count();
-    ref_width_ = detail::width_for(distinct == 0 ? 0 : distinct - 1);
+    // Remap savings belong on the interned side, or the model would price a
+    // layout it is not actually going to write.
     const std::uint64_t inline_bytes = count_ * (address_width_ + value_stride_);
-    const std::uint64_t interned_bytes = count_ * (address_width_ + ref_width_) +
-                                         fixed_dictionary_size(distinct, value_stride_);
+    std::uint64_t interned_bytes = count_ * (address_width_ + ref_width_) +
+                                   fixed_dictionary_size(distinct, value_stride_);
+    interned_bytes -= std::min(interned_bytes, remap_savings);
 
     switch (options_.value_interning) {
       case interning_policy::always: interned_ = true; break;
@@ -397,6 +425,26 @@ class table_builder {
     report.record_stride = record_stride_;
     report.inline_estimate = inline_bytes;
     report.interned_estimate = interned_bytes;
+  }
+
+  /// Local reference width for a partition holding `distinct_here` distinct
+  /// tuples across `count` records, or remap::none when a local table would not
+  /// pay for itself. `savings` receives the record bytes it would save.
+  ///
+  /// Note the address width cancels out -- it is the same in both layouts -- so
+  /// this can be priced before the address width is even known.
+  [[nodiscard]] std::uint32_t plan_remap(std::uint64_t distinct_here, std::uint64_t count,
+                                         std::uint64_t& savings) const {
+    savings = 0;
+    if (!options_.partition_remap || distinct_here == 0) return remap::none;
+    const unsigned local = detail::width_for(distinct_here - 1);
+    // A local index no narrower than the global one cannot repay its table.
+    if (local >= ref_width_ || local > remap::max_local_width) return remap::none;
+    const std::uint64_t table = distinct_here * sizeof(std::uint32_t);
+    const std::uint64_t saved = count * (ref_width_ - local);
+    if (saved <= table) return remap::none;
+    savings = saved - table;
+    return local;
   }
 
   [[nodiscard]] std::uint32_t text_slot(field_id id) const {
@@ -479,24 +527,68 @@ class table_builder {
 
     // Records, grouped into partitions. Input is key-ordered, so partitions come
     // out non-decreasing and a directory slot opens whenever it changes.
+    // Records, one partition at a time. Input is key-ordered, so a partition's
+    // records are contiguous, which is what lets each one be priced and written
+    // in a single pass without holding every remap table in memory at once.
     pad_to(8);
     std::vector<dir_entry> directory;
     std::vector<std::byte> record(record_stride_);
-    for (std::uint64_t i = 0; i < staging_->size(); ++i) {
-      const std::uint64_t key = staging_->key_at(i);
-      const std::uint64_t partition = partition_of(key);
-      if (directory.empty() || directory.back().partition != partition) {
-        directory.push_back(dir_entry{partition, pos, 0, 0, 0});
-      }
-      std::memset(record.data(), 0, record.size());
-      detail::store_uint(record.data(), address_width_, address_of(key));
+    std::vector<std::uint64_t> remap_table;                       // local -> global
+    std::unordered_map<std::uint64_t, std::uint32_t> to_local;    // global -> local
+    const std::uint64_t rows = staging_->size();
+    std::uint64_t i = 0;
+    while (i < rows) {
+      const std::uint64_t partition = partition_of(staging_->key_at(i));
+      std::uint64_t j = i;
+      while (j < rows && partition_of(staging_->key_at(j)) == partition) ++j;
+      const std::uint64_t count = j - i;
+
+      std::uint32_t schema_id = remap::none;
+      remap_table.clear();
+      to_local.clear();
       if (interned_) {
-        detail::store_uint(record.data() + address_width_, ref_width_, staging_->tuple_at(i));
-      } else {
-        encode_tuple(staging_->tuple_at(i), record.data() + address_width_);
+        // First-appearance order, so a rebuild of the same input is identical.
+        for (std::uint64_t k = i; k < j; ++k) {
+          const std::uint64_t global = staging_->tuple_at(k);
+          if (to_local.emplace(global, static_cast<std::uint32_t>(remap_table.size())).second) {
+            remap_table.push_back(global);
+          }
+        }
+        std::uint64_t saved = 0;
+        schema_id = plan_remap(remap_table.size(), count, saved);
+        if (schema_id == remap::none) {
+          remap_table.clear();
+          to_local.clear();
+        } else {
+          ++report.remapped_partitions;
+          report.remap_saved_bytes += saved;
+        }
       }
-      emit(record.data(), record.size());
-      ++directory.back().count;
+
+      directory.push_back(dir_entry{partition, pos, count, schema_id,
+                                    static_cast<std::uint32_t>(remap_table.size())});
+
+      for (const std::uint64_t global : remap_table) {
+        const auto id = static_cast<std::uint32_t>(global);
+        emit(&id, sizeof(id));
+      }
+
+      const unsigned width = schema_id != remap::none ? schema_id : ref_width_;
+      const std::size_t stride =
+          interned_ ? address_width_ + width : address_width_ + value_stride_;
+      for (std::uint64_t k = i; k < j; ++k) {
+        std::memset(record.data(), 0, stride);
+        detail::store_uint(record.data(), address_width_, address_of(staging_->key_at(k)));
+        if (interned_) {
+          const std::uint64_t global = staging_->tuple_at(k);
+          const std::uint64_t ref = schema_id != remap::none ? to_local[global] : global;
+          detail::store_uint(record.data() + address_width_, width, ref);
+        } else {
+          encode_tuple(staging_->tuple_at(k), record.data() + address_width_);
+        }
+        emit(record.data(), stride);
+      }
+      i = j;
     }
 
     pad_to(8);

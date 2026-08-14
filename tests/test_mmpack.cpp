@@ -784,6 +784,234 @@ void test_dedup_give_up() {
   CHECK(rep2.distinct_values == 3);
 }
 
+/// Many distinct tuples globally (forcing a 2-byte global reference) but only a
+/// handful in each partition (which fit a 1-byte local index) -- the shape
+/// per-partition remap exists for.
+std::pair<std::unique_ptr<mmpack::vector_sink>, mmpack::build_report> build_remap_case(
+    bool remap, std::uint64_t partitions = 400, std::uint64_t per_partition = 100,
+    std::uint64_t distinct_each = 10) {
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  auto sink = std::make_unique<mmpack::vector_sink>();
+  mmpack::build_options o;
+  o.address_bits = 8;
+  o.value_interning = mmpack::interning_policy::always;
+  o.partition_remap = remap;
+  mmpack::table_builder tb(sb, o);
+  for (std::uint64_t p = 0; p < partitions; ++p) {
+    for (std::uint64_t a = 0; a < per_partition; ++a) {
+      auto rec = tb.begin_record((p << 8) | a);
+      rec.set_uint(f, p * distinct_each + (a % distinct_each));
+      tb.commit(rec);
+    }
+  }
+  const auto report = tb.finish(*sink);
+  return {std::move(sink), report};
+}
+
+void test_partition_remap() {
+  auto [plain_sink, plain] = build_remap_case(false);
+  auto [remap_sink, remapped] = build_remap_case(true);
+
+  // The global reference must genuinely be wider than the local one, or the
+  // test would prove nothing.
+  CHECK(plain.ref_width == 2);
+  CHECK(plain.remapped_partitions == 0);
+  CHECK(remapped.remapped_partitions == 400);
+  CHECK(remapped.remap_saved_bytes > 0);
+  CHECK(remap_sink->size() < plain_sink->size());
+
+  const auto a = mmpack::table::open(plain_sink->data(), plain_sink->size());
+  const auto b = mmpack::table::open(remap_sink->data(), remap_sink->size());
+  CHECK(a.size() == b.size());
+  const auto fa = a.field("v").value();
+  const auto fb = b.field("v").value();
+
+  // Every record must resolve to the same value through both layouts.
+  for (std::uint64_t p = 0; p < 400; ++p) {
+    for (std::uint64_t addr = 0; addr < 100; ++addr) {
+      const std::uint64_t key = (p << 8) | addr;
+      const auto ia = a.find(key);
+      const auto ib = b.find(key);
+      CHECK(ia != a.end());
+      CHECK(ib != b.end());
+      if (ia == a.end() || ib == b.end()) continue;
+      const std::uint64_t want = p * 10 + (addr % 10);
+      CHECK(a.uint(ia, fa).value() == want);
+      CHECK(b.uint(ib, fb).value() == want);
+    }
+  }
+
+  // Iteration, and every search entry point, must agree key for key.
+  auto ia = a.begin();
+  auto ib = b.begin();
+  for (; ia != a.end() && ib != b.end(); ++ia, ++ib) {
+    CHECK(ia.key() == ib.key());
+    CHECK(a.uint(ia, fa) == b.uint(ib, fb));
+  }
+  CHECK(ia == a.end());
+  CHECK(ib == b.end());
+
+  std::mt19937_64 rng(31337);
+  for (int i = 0; i < 4000; ++i) {
+    const std::uint64_t probe = rng() % (400ull << 8);
+    const auto la = a.lower_bound(probe);
+    const auto lb = b.lower_bound(probe);
+    CHECK((la == a.end()) == (lb == b.end()));
+    if (la != a.end() && lb != b.end()) CHECK(la.key() == lb.key());
+
+    const auto flr_a = a.floor(probe);
+    const auto flr_b = b.floor(probe);
+    CHECK((flr_a == a.end()) == (flr_b == b.end()));
+    if (flr_a != a.end() && flr_b != b.end()) {
+      CHECK(flr_a.key() == flr_b.key());
+      CHECK(a.uint(flr_a, fa) == b.uint(flr_b, fb));
+    }
+  }
+}
+
+void test_partition_remap_is_selective() {
+  // A partition whose tuples are nearly all distinct cannot repay a remap table,
+  // so the builder must leave it on the global reference. Mixed images are the
+  // interesting case because the reader has to switch stride per partition.
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::build_options o;
+  o.address_bits = 8;
+  o.value_interning = mmpack::interning_policy::always;
+  mmpack::table_builder tb(sb, o);
+
+  std::map<std::uint64_t, std::uint64_t> oracle;
+  for (std::uint64_t p = 0; p < 300; ++p) {
+    for (std::uint64_t a = 0; a < 200; ++a) {
+      // Even partitions repeat a few values; odd ones are all distinct.
+      const std::uint64_t v = (p % 2 == 0) ? p * 1000 + (a % 4) : p * 1000 + a;
+      const std::uint64_t key = (p << 8) | a;
+      auto rec = tb.begin_record(key);
+      rec.set_uint(f, v);
+      tb.commit(rec);
+      oracle[key] = v;
+    }
+  }
+  const auto report = tb.finish(sink);
+
+  // Some remapped, some not -- that is the mixed image we want to read back.
+  CHECK(report.remapped_partitions > 0);
+  CHECK(report.remapped_partitions < 300);
+  CHECK(report.ref_width >= 2);
+
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  const auto id = t.field("v").value();
+  CHECK(t.size() == oracle.size());
+  for (const auto& [k, v] : oracle) {
+    const auto it = t.find(k);
+    CHECK(it != t.end());
+    if (it != t.end()) CHECK(t.uint(it, id).value() == v);
+  }
+  auto want = oracle.begin();
+  for (auto it = t.begin(); it != t.end(); ++it, ++want) {
+    CHECK(it.key() == want->first);
+    CHECK(t.uint(it, id).value() == want->second);
+  }
+}
+
+void test_remap_corruption() {
+  // 60 partitions x 5 distinct = 300 global tuples, so the global reference is
+  // 2 bytes and a 1-byte local index is genuinely narrower. Fewer partitions
+  // would leave the global reference at 1 byte and nothing would remap.
+  auto [sink, report] = build_remap_case(true, 60, 100, 5);
+  CHECK(report.ref_width == 2);
+  CHECK(report.remapped_partitions == 60);
+  const auto& image = sink->bytes();
+  mmpack::status s = mmpack::status::ok;
+
+  const auto footer_of = [](const std::vector<std::byte>& img) {
+    return mmpack::detail::load<mmpack::footer>(img.data() + img.size() - sizeof(mmpack::footer));
+  };
+  const auto slot_of = [&](std::vector<std::byte>& img, std::uint64_t i) {
+    const auto f = footer_of(img);
+    return mmpack::detail::load<mmpack::dir_entry>(img.data() + f.dir_offset +
+                                                   i * sizeof(mmpack::dir_entry));
+  };
+  const auto put_slot = [&](std::vector<std::byte>& img, std::uint64_t i,
+                            const mmpack::dir_entry& d) {
+    const auto f = footer_of(img);
+    mmpack::detail::store(img.data() + f.dir_offset + i * sizeof(mmpack::dir_entry), d);
+  };
+
+  {  // an impossible local reference width
+    auto corrupt = image;
+    auto d = slot_of(corrupt, 0);
+    d.schema_id = 7;
+    put_slot(corrupt, 0, d);
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_directory);
+  }
+  {  // remapped, but with no remap table to resolve through
+    auto corrupt = image;
+    auto d = slot_of(corrupt, 0);
+    d.remap_count = 0;
+    put_slot(corrupt, 0, d);
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_directory);
+  }
+  {  // a remap table claiming more entries than the image can hold
+    auto corrupt = image;
+    auto d = slot_of(corrupt, 0);
+    d.remap_count = 1u << 30;
+    put_slot(corrupt, 0, d);
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_directory);
+  }
+  {  // a remap table on a partition that is not remapped
+    auto corrupt = image;
+    auto d = slot_of(corrupt, 0);
+    d.schema_id = 0;
+    put_slot(corrupt, 0, d);  // remap_count stays non-zero
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_directory);
+  }
+  {  // a local index past the end of its remap table must not read the records
+     // that follow it -- this is the one that only fails at access time
+    auto corrupt = image;
+    const auto d = slot_of(corrupt, 0);
+    CHECK(d.schema_id == 1);
+    std::byte* records =
+        corrupt.data() + d.offset + d.remap_count * sizeof(std::uint32_t);
+    const auto t0 = mmpack::table::open(corrupt.data(), corrupt.size());
+    const auto id = t0.field("v").value();
+    CHECK(t0.uint(t0.begin(), id).has_value());  // fine before corruption
+
+    records[/*address_width=*/1] = std::byte{0xff};  // local index 255, table has 5
+    const auto t1 = mmpack::table::open(corrupt.data(), corrupt.size());
+    CHECK(!t1.uint(t1.begin(), id).has_value());
+    CHECK(t1.begin().key() == 0);  // the key still reads: it lives in the record
+  }
+  {  // remap declared on an image that is not interned at all
+    mmpack::schema_builder sb;
+    const auto f = sb.add_uint("v");
+    mmpack::vector_sink plain;
+    mmpack::build_options o;
+    o.value_interning = mmpack::interning_policy::never;
+    mmpack::table_builder tb(sb, o);
+    for (std::uint64_t i = 0; i < 50; ++i) {
+      auto rec = tb.begin_record(i);
+      rec.set_uint(f, i);
+      tb.commit(rec);
+    }
+    tb.finish(plain);
+
+    auto corrupt = plain.bytes();
+    auto d = slot_of(corrupt, 0);
+    d.schema_id = 1;
+    d.remap_count = 4;
+    put_slot(corrupt, 0, d);
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_directory);
+  }
+}
+
 void test_rejects_bad_images() {
   const auto rows = make_rows(500, 30);
   mmpack::build_options options;
@@ -988,6 +1216,9 @@ int main() {
   run("dense and sparse directories", test_dense_and_sparse_directories);
   run("align fields option", test_align_fields_option);
   run("dedup give up", test_dedup_give_up);
+  run("partition remap", test_partition_remap);
+  run("partition remap is selective", test_partition_remap_is_selective);
+  run("remap corruption", test_remap_corruption);
   run("rejects bad images", test_rejects_bad_images);
   run("corrupt value reference", test_corrupt_value_reference);
   run("large randomized both modes", test_large_randomized_both_modes);

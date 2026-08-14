@@ -151,12 +151,28 @@ class table {
       const dir_entry d = t.slot(i);
       if (i > 0 && d.partition <= previous) return fail(status::bad_directory);
       if (t.dense_ && d.partition != i) return fail(status::bad_directory);
+
+      // A remapped partition carries its own reference width and lookup table,
+      // so its geometry has to be validated before it can be trusted to size
+      // the record block.
+      std::uint64_t stride = t.record_stride_;
+      if (d.schema_id != remap::none) {
+        if (d.schema_id > remap::max_local_width) return fail(status::bad_directory);
+        if (!t.interned_) return fail(status::bad_directory);  // nothing to remap into
+        if (d.remap_count == 0 || d.count == 0) return fail(status::bad_directory);
+        stride = t.address_width_ + d.schema_id;
+      } else if (d.remap_count != 0) {
+        return fail(status::bad_directory);
+      }
+
       if (d.count != 0) {
         if (d.offset < floor || d.offset > foot.dir_offset) return fail(status::bad_directory);
-        if (d.count > (foot.dir_offset - d.offset) / t.record_stride_) {
-          return fail(status::bad_directory);
-        }
-        floor = d.offset + d.count * t.record_stride_;
+        const std::uint64_t available = foot.dir_offset - d.offset;
+        const std::uint64_t table_bytes =
+            static_cast<std::uint64_t>(d.remap_count) * sizeof(std::uint32_t);
+        if (table_bytes > available) return fail(status::bad_directory);
+        if (d.count > (available - table_bytes) / stride) return fail(status::bad_directory);
+        floor = d.offset + table_bytes + d.count * stride;
       }
       total += d.count;
       previous = d.partition;
@@ -241,7 +257,9 @@ class table {
                                               std::uint64_t address) const {
     std::uint64_t slot = slot_lower_bound(partition);
     std::uint64_t index = 0;
-    if (slot < dir_count_ && slot_partition(slot) == partition) index = search_lower(slot, address);
+    if (slot < dir_count_ && slot_partition(slot) == partition) {
+      index = search_lower(layout_of(slot), address);
+    }
     normalize(slot, index);
     return const_iterator(this, slot, index);
   }
@@ -250,7 +268,9 @@ class table {
                                               std::uint64_t address) const {
     std::uint64_t slot = slot_lower_bound(partition);
     std::uint64_t index = 0;
-    if (slot < dir_count_ && slot_partition(slot) == partition) index = search_upper(slot, address);
+    if (slot < dir_count_ && slot_partition(slot) == partition) {
+      index = search_upper(layout_of(slot), address);
+    }
     normalize(slot, index);
     return const_iterator(this, slot, index);
   }
@@ -275,10 +295,10 @@ class table {
     if (slot >= dir_count_) return end();  // every partition is above the target
 
     if (slot_partition(slot) == partition) {
-      const std::uint64_t count = slot_count(slot);
-      if (count != 0) {
-        const std::uint64_t index = search_floor(slot, address);
-        if (index < count) return const_iterator(this, slot, index);
+      const partition_layout p = layout_of(slot);
+      if (p.count != 0) {
+        const std::uint64_t index = search_floor(p, address);
+        if (index < p.count) return const_iterator(this, slot, index);
       }
       // The partition exists but holds nothing at or below `address`, so the
       // answer is the tail of an earlier partition.
@@ -296,10 +316,11 @@ class table {
   [[nodiscard]] const_iterator find_at(std::uint64_t partition, std::uint64_t address) const {
     const std::uint64_t slot = slot_exact(partition);
     if (slot >= dir_count_) return end();
-    const std::uint64_t count = slot_count(slot);
-    if (count == 0) return end();
-    const std::uint64_t index = search_lower(slot, address);
-    if (index >= count || address_at(slot, index) != address) return end();
+    const partition_layout p = layout_of(slot);
+    if (p.count == 0) return end();
+    const std::uint64_t index = search_lower(p, address);
+    if (index >= p.count) return end();
+    if (detail::load_uint(p.records + index * p.stride, address_width_) != address) return end();
     return const_iterator(this, slot, index);
   }
 
@@ -376,11 +397,42 @@ class table {
                                        offsetof(dir_entry, count));
   }
 
+  /// Everything about one partition's byte layout, read from the directory in a
+  /// single 32-byte load. Stride varies per partition once remapping is in play,
+  /// so it is resolved once here rather than re-derived at each access.
+  struct partition_layout {
+    const std::byte* records = nullptr;
+    const std::byte* remap = nullptr;  ///< null unless the partition is remapped
+    std::uint64_t count = 0;
+    std::uint32_t remap_count = 0;
+    unsigned stride = 0;
+    unsigned ref_width = 0;  ///< local width when remapped, else the global one
+    bool remapped = false;
+  };
+
+  [[nodiscard]] partition_layout layout_of(std::uint64_t s) const {
+    const dir_entry d = slot(s);
+    partition_layout out;
+    out.count = d.count;
+    out.remapped = d.schema_id != remap::none;
+    out.remap_count = d.remap_count;
+    out.ref_width = out.remapped ? d.schema_id : ref_width_;
+    out.stride = out.remapped ? address_width_ + d.schema_id : record_stride_;
+    out.remap = out.remapped ? base_ + d.offset : nullptr;
+    out.records = base_ + d.offset +
+                  (out.remapped
+                       ? static_cast<std::uint64_t>(d.remap_count) * sizeof(std::uint32_t)
+                       : 0);
+    return out;
+  }
+
   [[nodiscard]] const std::byte* record(std::uint64_t s, std::uint64_t i) const {
-    return base_ + slot_offset(s) + i * record_stride_;
+    const partition_layout p = layout_of(s);
+    return p.records + i * p.stride;
   }
   [[nodiscard]] std::uint64_t address_at(std::uint64_t s, std::uint64_t i) const {
-    return detail::load_uint(record(s, i), address_width_);
+    const partition_layout p = layout_of(s);
+    return detail::load_uint(p.records + i * p.stride, address_width_);
   }
   [[nodiscard]] std::uint64_t key_at(std::uint64_t s, std::uint64_t i) const {
     const std::uint64_t bits = schema_.address_bits();
@@ -393,9 +445,18 @@ class table {
   /// is what keeps a corrupt reference from becoming a wild read.
   [[nodiscard]] const std::byte* value_base(const const_iterator& it) const {
     if (it.slot_ >= dir_count_) return nullptr;
-    const std::byte* r = record(it.slot_, it.index_);
+    const partition_layout p = layout_of(it.slot_);
+    const std::byte* r = p.records + it.index_ * p.stride;
     if (!interned_) return r + address_width_;
-    const std::uint64_t ref = detail::load_uint(r + address_width_, ref_width_);
+
+    std::uint64_t ref = detail::load_uint(r + address_width_, p.ref_width);
+    if (p.remapped) {
+      // The local index only means anything through this partition's table, and
+      // a corrupt one would otherwise read straight into the records that
+      // follow it.
+      if (ref >= p.remap_count) return nullptr;
+      ref = detail::load<std::uint32_t>(p.remap + ref * sizeof(std::uint32_t));
+    }
     return value_dict_.element(ref);
   }
 
@@ -501,14 +562,14 @@ class table {
     return floor_at_or_before(s - 1);
   }
 
-  [[nodiscard]] std::uint64_t search_lower(std::uint64_t s, std::uint64_t address) const {
-    const std::byte* first = base_ + slot_offset(s);
+  [[nodiscard]] std::uint64_t search_lower(const partition_layout& p,
+                                           std::uint64_t address) const {
     std::uint64_t lo = 0;
-    std::uint64_t len = slot_count(s);
+    std::uint64_t len = p.count;
     while (len > 0) {
       const std::uint64_t half = len / 2;
       const std::uint64_t mid = lo + half;
-      if (detail::load_uint(first + mid * record_stride_, address_width_) < address) {
+      if (detail::load_uint(p.records + mid * p.stride, address_width_) < address) {
         lo = mid + 1;
         len -= half + 1;
       } else {
@@ -523,19 +584,20 @@ class table {
   /// stepped back one, so the scan itself is unchanged -- the win over calling
   /// upper_bound() and decrementing is that no iterator is ever positioned past
   /// the partition and then walked back.
-  [[nodiscard]] std::uint64_t search_floor(std::uint64_t s, std::uint64_t address) const {
-    const std::uint64_t above = search_upper(s, address);
-    return above == 0 ? slot_count(s) : above - 1;
+  [[nodiscard]] std::uint64_t search_floor(const partition_layout& p,
+                                           std::uint64_t address) const {
+    const std::uint64_t above = search_upper(p, address);
+    return above == 0 ? p.count : above - 1;
   }
 
-  [[nodiscard]] std::uint64_t search_upper(std::uint64_t s, std::uint64_t address) const {
-    const std::byte* first = base_ + slot_offset(s);
+  [[nodiscard]] std::uint64_t search_upper(const partition_layout& p,
+                                           std::uint64_t address) const {
     std::uint64_t lo = 0;
-    std::uint64_t len = slot_count(s);
+    std::uint64_t len = p.count;
     while (len > 0) {
       const std::uint64_t half = len / 2;
       const std::uint64_t mid = lo + half;
-      if (!(address < detail::load_uint(first + mid * record_stride_, address_width_))) {
+      if (!(address < detail::load_uint(p.records + mid * p.stride, address_width_))) {
         lo = mid + 1;
         len -= half + 1;
       } else {

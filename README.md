@@ -69,6 +69,40 @@ interned        2150101        4        4.3         41.0
 `next_hop` line is the bias at work: values around 0.17 billion, stored in two
 bytes, because they only span a narrow range.
 
+### Per-partition value remap
+
+Under interning every record holds a reference into the global composite
+dictionary, so the reference is as wide as the *total* distinct tuple count
+demands — 4 bytes past 65536 tuples. But an individual partition usually touches
+only a handful of them. Giving such a partition its own table of the global ids
+it actually uses lets its records carry a 1- or 2-byte local index instead:
+
+```
+[remap table: remap_count * 4 bytes of global ids][records at address_width + local_width]
+```
+
+That is pure stride reduction on the search path, which is where it shows up.
+Measured on geo-IP-shaped data — 4.8M records, /16 partitions, ~30 distinct
+tuples each, 4-byte global reference:
+
+| | stride | image | ns/lookup |
+|---|---|---|---|
+| global reference | 6 (2+4) | 32.1 MB | 87.4 |
+| per-partition remap | **3** (2+1) | **22.4 MB** | **68.3** |
+
+Halving the stride doubles the records per cache line, and the binary search
+touches correspondingly fewer. Expect a larger effect than the −22% above once
+the image no longer fits in cache at all, since every avoided line becomes an
+avoided DRAM miss.
+
+It is decided per partition, and only where it pays: a table costs
+`distinct * 4` bytes, so it must save more than that in records. Partitions whose
+tuples are nearly all distinct keep the global reference, and one image freely
+mixes both — the reader takes the stride from the directory entry. Turn it off
+with `build_options.partition_remap = false`. `build_report` reports
+`remapped_partitions` and `remap_saved_bytes`, and the saving is folded into the
+interning cost model so the two decisions stay consistent.
+
 ## The interning cost model
 
 Interning is decided automatically at `finish()` and pays when
@@ -224,6 +258,12 @@ or one reference into the composite dictionary:
 - inline: `base = record + address_width`
 - interned: `base = value_dict + load(record + address_width, ref_width) * value_stride`
 
+Record stride is fixed *within* a partition but may differ *between* them: a
+remapped partition prefixes its records with a table of global tuple ids and
+narrows its references accordingly. `dir_entry::schema_id` carries the local
+reference width (0 = global) and `remap_count` the table length, so the reader
+resolves the geometry from one directory load before the search starts.
+
 Lookup is two steps as ever: select the partition (O(1) when partition indices
 are dense, O(log P) when sparse), then binary search the fixed-stride records.
 Key splitting is runtime configuration — `partition = key >> address_bits` — with
@@ -274,6 +314,8 @@ Requires C++20. Tested with Apple Clang 14 on arm64.
   checks; a wrong `uint` vs `text` call is a `nullopt`, not a build error.
 - **Runtime stride and field offsets** cost some lookup throughput against a
   compile-time layout. That is the trade this project exists to make.
-- **One schema per image.** `dir_entry` reserves a `schema_id` so per-partition
-  shapes can be added later without a format break.
+- **One value-tuple layout per image.** Field widths and offsets are global;
+  only the *reference* width varies per partition (see per-partition remap).
+  Per-partition field widths would be a larger change for, on these workloads,
+  a much smaller return.
 - **Iterators borrow the table**, which borrows the mapping. Keep both alive.
