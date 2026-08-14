@@ -327,6 +327,162 @@ void test_lookup_matches_std_map() {
   CHECK(rwant == oracle.rend());
 }
 
+void test_floor_and_ceil_match_oracle() {
+  // floor(k) is the range-containment primitive; the oracle is prev(upper_bound).
+  std::mt19937_64 rng(4242);
+  std::map<std::uint64_t, std::uint64_t> oracle;
+  std::uint64_t key = 0;
+
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::build_options options;
+  options.address_bits = 8;  // many small partitions, with gaps between them
+  mmpack::table_builder tb(sb, options);
+  for (int i = 0; i < 3000; ++i) {
+    key += 1 + rng() % 500;  // gaps within and across partitions
+    const std::uint64_t v = rng() % 1000;
+    auto rec = tb.begin_record(key);
+    rec.set_uint(f, v);
+    tb.commit(rec);
+    oracle[key] = v;
+  }
+  mmpack::vector_sink sink;
+  tb.finish(sink);
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  const auto id = t.field("v").value();
+
+  std::vector<std::uint64_t> probes;
+  for (const auto& [k, v] : oracle) {
+    probes.push_back(k);
+    probes.push_back(k - 1);
+    probes.push_back(k + 1);
+  }
+  probes.push_back(0);
+  probes.push_back(1);
+  probes.push_back(~std::uint64_t{0});
+
+  for (const std::uint64_t probe : probes) {
+    // floor
+    const auto got = t.floor(probe);
+    const auto above = oracle.upper_bound(probe);
+    if (above == oracle.begin()) {
+      CHECK(got == t.end());
+    } else {
+      const auto want = std::prev(above);
+      CHECK(got != t.end());
+      if (got != t.end()) {
+        CHECK(got.key() == want->first);
+        CHECK(t.uint(got, id).value() == want->second);
+        CHECK(got.key() <= probe);  // the defining property
+      }
+    }
+
+    // ceil is lower_bound, and must agree with it exactly
+    CHECK(t.ceil(probe) == t.lower_bound(probe));
+    const auto c = t.ceil(probe);
+    const auto want_c = oracle.lower_bound(probe);
+    if (want_c == oracle.end()) {
+      CHECK(c == t.end());
+    } else {
+      CHECK(c != t.end());
+      if (c != t.end()) {
+        CHECK(c.key() == want_c->first);
+        CHECK(c.key() >= probe);
+      }
+    }
+
+    // The pre-split forms must agree with the key forms.
+    const std::uint64_t p = t.schema().partition_of(probe);
+    const std::uint64_t a = t.schema().address_of(probe);
+    CHECK(t.floor_at(p, a) == got);
+    CHECK(t.ceil_at(p, a) == c);
+  }
+}
+
+void test_floor_edge_cases() {
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+
+  {  // empty table
+    mmpack::table_builder tb(sb, {});
+    mmpack::vector_sink sink;
+    tb.finish(sink);
+    const auto t = mmpack::table::open(sink.data(), sink.size());
+    CHECK(t.floor(0) == t.end());
+    CHECK(t.floor(~std::uint64_t{0}) == t.end());
+    CHECK(t.ceil(0) == t.end());
+  }
+
+  // Partitions 1 and 7 populated, everything between them empty. Exercises the
+  // cross-partition retreat, which is the only path that leaves the slot the
+  // search landed on.
+  mmpack::build_options options;
+  options.address_bits = 8;
+  mmpack::table_builder tb(sb, options);
+  for (std::uint64_t key : {0x0110ull, 0x0120ull, 0x0705ull}) {
+    auto rec = tb.begin_record(key);
+    rec.set_uint(f, key);
+    tb.commit(rec);
+  }
+  mmpack::vector_sink sink;
+  tb.finish(sink);
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+
+  CHECK(t.floor(0x0110).key() == 0x0110);  // exact hit on the first key
+  CHECK(t.floor(0x0111).key() == 0x0110);  // between keys in one partition
+  CHECK(t.floor(0x0120).key() == 0x0120);  // exact hit
+  CHECK(t.floor(0x0121).key() == 0x0120);  // past the last key of partition 1
+  CHECK(t.floor(0x0400).key() == 0x0120);  // partition that does not exist
+  CHECK(t.floor(0x0700).key() == 0x0120);  // partition 7 exists, but nothing <= 0x00
+  CHECK(t.floor(0x0705).key() == 0x0705);  // exact hit in the last partition
+  CHECK(t.floor(0x9999).key() == 0x0705);  // past everything -> the last element
+  CHECK(t.floor(0x010f) == t.end());       // before the first element
+  CHECK(t.floor(0x0000) == t.end());
+  CHECK(t.floor(0x0100) == t.end());       // same partition, below the first address
+
+  // ceil mirrors it.
+  CHECK(t.ceil(0x0000).key() == 0x0110);
+  CHECK(t.ceil(0x0121).key() == 0x0705);
+  CHECK(t.ceil(0x0705).key() == 0x0705);
+  CHECK(t.ceil(0x0706) == t.end());
+
+  // A floor result is a normal, usable iterator: dereferenceable and movable.
+  auto it = t.floor(0x0400);
+  CHECK(t.uint(it, f).value() == 0x0120);
+  ++it;
+  CHECK(it.key() == 0x0705);
+  --it;
+  CHECK(it.key() == 0x0120);
+}
+
+void test_floor_sparse_directory() {
+  // The sparse path uses a different slot search, so it needs its own coverage.
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::build_options options;
+  options.address_bits = 8;
+  mmpack::table_builder tb(sb, options);
+  const std::vector<std::uint64_t> keys = {(5ull << 8) | 3, (1ull << 30) | 9,
+                                           (1ull << 40) | 2};
+  for (std::uint64_t k : keys) {
+    auto rec = tb.begin_record(k);
+    rec.set_uint(f, k);
+    tb.commit(rec);
+  }
+  mmpack::vector_sink sink;
+  tb.finish(sink);
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  CHECK(!t.has_dense_directory());
+
+  CHECK(t.floor((5ull << 8) | 2) == t.end());       // below everything
+  CHECK(t.floor((5ull << 8) | 3).key() == keys[0]);  // exact
+  CHECK(t.floor((5ull << 8) | 4).key() == keys[0]);  // past the partition's end
+  CHECK(t.floor((9ull << 8)).key() == keys[0]);      // partition between two present ones
+  CHECK(t.floor((1ull << 30) | 9).key() == keys[1]);
+  CHECK(t.floor((1ull << 40) | 1).key() == keys[1]);  // last partition, below its first
+  CHECK(t.floor(~std::uint64_t{0}).key() == keys[2]);  // above everything
+}
+
 void test_cross_partition_fallthrough() {
   mmpack::schema_builder sb;
   const auto f = sb.add_uint("v");
@@ -821,6 +977,9 @@ int main() {
   run("width and bias selection", test_width_and_bias_selection);
   run("text dictionary widths", test_text_dictionary_widths);
   run("lookup matches std::map", test_lookup_matches_std_map);
+  run("floor and ceil match oracle", test_floor_and_ceil_match_oracle);
+  run("floor edge cases", test_floor_edge_cases);
+  run("floor sparse directory", test_floor_sparse_directory);
   run("cross partition fallthrough", test_cross_partition_fallthrough);
   run("input ordering", test_input_ordering);
   run("all field kinds", test_all_field_kinds);

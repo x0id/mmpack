@@ -255,6 +255,44 @@ class table {
     return const_iterator(this, slot, index);
   }
 
+  /// Greatest element with key <= target, or end() if every key is above it.
+  ///
+  /// This is the range-containment primitive: given boundary entries, floor()
+  /// names the range covering a point. Doing it with upper_bound() plus a
+  /// decrement works but puts a begin() check on every caller, and the check is
+  /// easy to forget or get subtly wrong.
+  [[nodiscard]] const_iterator floor(std::uint64_t key) const {
+    return floor_at(schema_.partition_of(key), schema_.address_of(key));
+  }
+
+  /// Least element with key >= target, or end(). Identical to lower_bound();
+  /// named for symmetry with floor() so containment code reads consistently.
+  [[nodiscard]] const_iterator ceil(std::uint64_t key) const { return lower_bound(key); }
+
+  /// As floor(), for callers that already hold the split key.
+  [[nodiscard]] const_iterator floor_at(std::uint64_t partition, std::uint64_t address) const {
+    const std::uint64_t slot = slot_floor(partition);
+    if (slot >= dir_count_) return end();  // every partition is above the target
+
+    if (slot_partition(slot) == partition) {
+      const std::uint64_t count = slot_count(slot);
+      if (count != 0) {
+        const std::uint64_t index = search_floor(slot, address);
+        if (index < count) return const_iterator(this, slot, index);
+      }
+      // The partition exists but holds nothing at or below `address`, so the
+      // answer is the tail of an earlier partition.
+      return floor_before(slot);
+    }
+    // slot_partition(slot) < partition: every element here precedes the target,
+    // so this partition's own tail is the answer -- if it has one.
+    return floor_at_or_before(slot);
+  }
+
+  [[nodiscard]] const_iterator ceil_at(std::uint64_t partition, std::uint64_t address) const {
+    return lower_bound_at(partition, address);
+  }
+
   [[nodiscard]] const_iterator find_at(std::uint64_t partition, std::uint64_t address) const {
     const std::uint64_t slot = slot_exact(partition);
     if (slot >= dir_count_) return end();
@@ -425,6 +463,44 @@ class table {
     return dir_count_;
   }
 
+  /// Last directory slot whose partition is <= p, or dir_count_ if every
+  /// partition is above p. Derived by stepping back from "first slot above p"
+  /// rather than computing p + 1, which would overflow at address_bits == 0.
+  [[nodiscard]] std::uint64_t slot_floor(std::uint64_t p) const {
+    if (dir_count_ == 0) return 0;  // equals dir_count_: the "none" sentinel
+    if (dense_) return p < dir_count_ ? p : dir_count_ - 1;
+    std::uint64_t lo = 0;
+    std::uint64_t len = dir_count_;
+    while (len > 0) {
+      const std::uint64_t half = len / 2;
+      const std::uint64_t mid = lo + half;
+      if (slot_partition(mid) <= p) {
+        lo = mid + 1;
+        len -= half + 1;
+      } else {
+        len = half;
+      }
+    }
+    return lo == 0 ? dir_count_ : lo - 1;
+  }
+
+  /// Last element of the greatest non-empty slot at or before `s`, or end().
+  [[nodiscard]] const_iterator floor_at_or_before(std::uint64_t s) const {
+    while (true) {
+      const std::uint64_t count = slot_count(s);
+      if (count != 0) return const_iterator(this, s, count - 1);
+      if (s == 0) return end();
+      --s;
+    }
+  }
+
+  /// Same, but strictly before `s` -- used when slot `s` is the target
+  /// partition and has already been shown to hold nothing low enough.
+  [[nodiscard]] const_iterator floor_before(std::uint64_t s) const {
+    if (s == 0) return end();
+    return floor_at_or_before(s - 1);
+  }
+
   [[nodiscard]] std::uint64_t search_lower(std::uint64_t s, std::uint64_t address) const {
     const std::byte* first = base_ + slot_offset(s);
     std::uint64_t lo = 0;
@@ -440,6 +516,16 @@ class table {
       }
     }
     return lo;
+  }
+
+  /// Index of the largest address <= target within a slot, or slot_count(s) as
+  /// a "none here" sentinel. Structurally this is search_upper with the result
+  /// stepped back one, so the scan itself is unchanged -- the win over calling
+  /// upper_bound() and decrementing is that no iterator is ever positioned past
+  /// the partition and then walked back.
+  [[nodiscard]] std::uint64_t search_floor(std::uint64_t s, std::uint64_t address) const {
+    const std::uint64_t above = search_upper(s, address);
+    return above == 0 ? slot_count(s) : above - 1;
   }
 
   [[nodiscard]] std::uint64_t search_upper(std::uint64_t s, std::uint64_t address) const {

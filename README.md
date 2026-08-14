@@ -104,6 +104,53 @@ dictionary outgrows cache. And **sequential scans get worse under interning
 regardless of size**, since iterating in key order touches the dictionary
 randomly — scan-heavy workloads should set `value_interning = never`.
 
+## Searching
+
+| method | returns |
+|---|---|
+| `find(k)` | exact match, or `end()` |
+| `lower_bound(k)` / `ceil(k)` | least entry with key ≥ k, or `end()` |
+| `upper_bound(k)` | least entry with key > k, or `end()` |
+| `floor(k)` | greatest entry with key ≤ k, or `end()` |
+
+Each has a `_at(partition, address)` form for callers who split keys themselves.
+
+`floor()` is the **range-containment** primitive: given boundary entries, it
+names the range covering a point. That query is otherwise a two-step dance with a
+begin() check that every caller has to remember:
+
+```cpp
+auto it = t.floor(ip);                    // one call
+if (it == t.end()) { /* not covered */ }
+
+auto it = t.upper_bound(ip);              // the same thing, by hand
+if (it == t.begin()) { /* not covered */ }
+else --it;
+```
+
+`ceil()` is `lower_bound()` under a name that reads symmetrically next to
+`floor()`; it is a trivial forwarding call, not a second implementation.
+
+**On speed:** `floor()` is measurably but modestly faster than
+`upper_bound()` + `--it` — around 3–7% on shallow searches, and within noise when
+the binary search dominates. It was worth measuring, because the intuition that
+it saves a cache line does not hold: the record at the upper-bound position is
+never dereferenced by either formulation. What `floor()` actually saves is the
+`normalize()` that walks an iterator forward past the partition end, and the
+`retreat()` that walks it back — a handful of branches and directory loads.
+Measured over 500k boundary entries, 2M probes:
+
+| workload | `floor` | `upper_bound` + `--it` | delta |
+|---|---|---|---|
+| probes just past a stored key | 18.8 ns | 20.2 ns | −6.7% |
+| random probes, many empty partitions | 19.4 ns | 20.3 ns | −4.5% |
+| random probes, 10 large partitions | 68.0 ns | 66.6 ns | +2.2% |
+
+The last row is the honest one: with few, large partitions the search itself is
+cache-bound and dominates, so the saving disappears into noise. Reach for
+`floor()` because it makes containment queries a single correct call, not because
+it is fast.
+
 ## Fields
 
 | kind | stored as | width |

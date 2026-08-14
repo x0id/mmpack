@@ -116,6 +116,15 @@ std::uint64_t exercise(const mmpack::table& t, const fields& ids) {
       if (auto ub = t.upper_bound(k); ub != t.end()) sink += ub.address();
       if (auto f = t.find(k); f != t.end()) sink += f.key();
       sink += t.contains(k) ? 1 : 0;
+      // floor() walks directory slots backwards, which no other entry point
+      // does, so a corrupt directory has to be aimed at it directly.
+      if (auto fl = t.floor(k); fl != t.end()) {
+        sink += fl.key();
+        if (auto v = t.uint(fl, ids.population)) sink += *v;
+      }
+      if (auto ce = t.ceil(k); ce != t.end()) sink += ce.address();
+      if (auto fl = t.floor_at(k >> 8, k & 0xff); fl != t.end()) sink += fl.address();
+      if (auto ce = t.ceil_at(k >> 8, k & 0xff); ce != t.end()) sink += ce.address();
     }
   }
   return sink;
