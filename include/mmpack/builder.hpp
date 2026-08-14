@@ -110,6 +110,14 @@ class record_staging {
   virtual std::uint64_t partition_at(std::uint64_t i) const noexcept = 0;
   virtual std::uint64_t address_at(std::uint64_t i) const noexcept = 0;
   virtual std::uint64_t tuple_at(std::uint64_t i) const noexcept = 0;
+
+  /// Only implemented by staging that holds addresses too wide for a scalar.
+  /// The narrow implementations keep the address as an integer and have no
+  /// stable bytes to hand out, so they return an empty span; the builder asks
+  /// for one form or the other according to the mode it is in.
+  [[nodiscard]] virtual std::span<const std::byte> address_bytes_at(std::uint64_t) const noexcept {
+    return {};
+  }
 };
 
 /// Staging for images that do have a 64-bit key space: the two parts are packed
@@ -153,6 +161,86 @@ class memory_staging final : public record_staging {
   };
   std::vector<row> rows_;
   unsigned address_bits_;
+  bool sorted_ = true;
+};
+
+/// Staging for addresses too wide for a scalar. The width is uniform, so the
+/// bytes live in a flat arena indexed by record number and need no per-record
+/// offset: 16 bytes plus the address width per record.
+class blob_staging final : public record_staging {
+ public:
+  explicit blob_staging(unsigned address_width) : width_(address_width) {}
+
+  void push(std::uint64_t, std::uint64_t, std::uint64_t) override {
+    throw build_error("blob_staging needs the address bytes; use push_bytes()");
+  }
+
+  void push_bytes(std::uint64_t partition, std::span<const std::byte> address,
+                  std::uint64_t tuple_id) {
+    if (address.size() != width_) throw build_error("address width changed mid-build");
+    if (!rows_.empty() && !before(rows_.size() - 1, partition, address)) sorted_ = false;
+    rows_.push_back(row{partition, tuple_id});
+    arena_.insert(arena_.end(), address.begin(), address.end());
+  }
+
+  [[nodiscard]] bool is_sorted() const noexcept override { return sorted_; }
+
+  void sort() override {
+    // Sort an index, then rebuild both arrays: the arena is fixed-stride, so
+    // permuting it directly would need the same gather anyway.
+    std::vector<std::uint64_t> order(rows_.size());
+    for (std::uint64_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [this](std::uint64_t a, std::uint64_t b) {
+      if (rows_[a].partition != rows_[b].partition) {
+        return rows_[a].partition < rows_[b].partition;
+      }
+      return std::memcmp(slot(a), slot(b), width_) < 0;
+    });
+
+    std::vector<row> sorted_rows;
+    std::vector<std::byte> sorted_arena;
+    sorted_rows.reserve(rows_.size());
+    sorted_arena.reserve(arena_.size());
+    for (const std::uint64_t i : order) {
+      sorted_rows.push_back(rows_[i]);
+      sorted_arena.insert(sorted_arena.end(), slot(i), slot(i) + width_);
+    }
+    rows_.swap(sorted_rows);
+    arena_.swap(sorted_arena);
+    sorted_ = true;
+  }
+
+  [[nodiscard]] std::uint64_t size() const noexcept override { return rows_.size(); }
+  [[nodiscard]] std::uint64_t partition_at(std::uint64_t i) const noexcept override {
+    return rows_[i].partition;
+  }
+  /// Never meaningful here: the whole point is that the address does not fit.
+  [[nodiscard]] std::uint64_t address_at(std::uint64_t) const noexcept override { return 0; }
+  [[nodiscard]] std::span<const std::byte> address_bytes_at(
+      std::uint64_t i) const noexcept override {
+    return {slot(i), width_};
+  }
+  [[nodiscard]] std::uint64_t tuple_at(std::uint64_t i) const noexcept override {
+    return rows_[i].tuple;
+  }
+
+ private:
+  [[nodiscard]] const std::byte* slot(std::uint64_t i) const noexcept {
+    return arena_.data() + i * width_;
+  }
+  [[nodiscard]] bool before(std::uint64_t last, std::uint64_t partition,
+                            std::span<const std::byte> address) const noexcept {
+    if (rows_[last].partition != partition) return rows_[last].partition < partition;
+    return std::memcmp(slot(last), address.data(), width_) < 0;
+  }
+
+  struct row {
+    std::uint64_t partition;
+    std::uint64_t tuple;
+  };
+  std::vector<row> rows_;
+  std::vector<std::byte> arena_;
+  unsigned width_;
   bool sorted_ = true;
 };
 
@@ -205,8 +293,9 @@ class table_builder;
 /// Which key world a build is in, fixed by its first record.
 enum class key_mode {
   undecided,
-  keyed,     ///< begin_record(uint64), split by options.address_bits
-  explicit_,  ///< begin_record_at(partition, address), split by the caller
+  keyed,          ///< begin_record(uint64), split by options.address_bits
+  explicit_,      ///< begin_record_at(partition, uint64 address)
+  explicit_wide,  ///< begin_record_at(partition, span) -- an address past 64 bits
 };
 
 class record_ref {
@@ -273,19 +362,52 @@ class table_builder {
     return record_ref(this, partition, address);
   }
 
+  /// Begin a record whose address is too wide for a scalar -- an IPv6 host part,
+  /// a hash, anything. The bytes are opaque: they are stored as given and
+  /// compared lexicographically, so the encoding must be order-preserving. Big
+  /// endian usually is, and IPv6 network order already is.
+  ///
+  /// The width is fixed by the first such record, because a uniform stride is
+  /// what makes the binary search possible.
+  [[nodiscard]] record_ref begin_record_at(std::uint64_t partition,
+                                           std::span<const std::byte> address) {
+    if (address.empty()) throw build_error("a wide address must have at least one byte");
+    enter_wide_mode(static_cast<unsigned>(address.size()));
+    if (address.size() != wide_width_) {
+      throw build_error("every address must be the same width: got " +
+                        std::to_string(address.size()) + " after " +
+                        std::to_string(wide_width_));
+    }
+    pending_address_.assign(address.begin(), address.end());
+    std::fill(slots_.begin(), slots_.end(), std::uint64_t{0});
+    return record_ref(this, partition, 0);
+  }
+
   void commit(const record_ref& rec) {
     if (finished_) throw build_error("commit() after finish()");
     // Ordering is on (partition, address), which is what the image is sorted by.
-    // For keyed builds that is the same comparison as on the key itself.
-    if (options_.order == input_order::assume_sorted && count_ != 0 &&
-        !(last_partition_ < rec.partition_ ||
-          (last_partition_ == rec.partition_ && last_address_ < rec.address_))) {
-      throw build_error("keys must arrive strictly increasing: (" +
-                        std::to_string(rec.partition_) + ", " + std::to_string(rec.address_) +
-                        ") followed (" + std::to_string(last_partition_) + ", " +
-                        std::to_string(last_address_) + ")");
+    // For keyed builds that is the same comparison as on the key itself; for
+    // wide addresses it is a byte comparison, matching how the reader searches.
+    if (options_.order == input_order::assume_sorted && count_ != 0) {
+      const bool increasing =
+          last_partition_ < rec.partition_ ||
+          (last_partition_ == rec.partition_ &&
+           (blob_ != nullptr
+                ? std::memcmp(last_wide_.data(), pending_address_.data(), wide_width_) < 0
+                : last_address_ < rec.address_));
+      if (!increasing) {
+        throw build_error("keys must arrive strictly increasing at partition " +
+                          std::to_string(rec.partition_));
+      }
     }
-    staging_->push(rec.partition_, rec.address_, intern_tuple());
+
+    const std::uint64_t tuple = intern_tuple();
+    if (blob_ != nullptr) {
+      blob_->push_bytes(rec.partition_, pending_address_, tuple);
+      last_wide_ = pending_address_;
+    } else {
+      staging_->push(rec.partition_, rec.address_, tuple);
+    }
     last_partition_ = rec.partition_;
     last_address_ = rec.address_;
     ++count_;
@@ -308,7 +430,7 @@ class table_builder {
     report.records = count_;
     report.distinct_values = tuple_count();
     report.dedup_abandoned = !dedup_active_;
-    report.has_key_mapping = mode_ != key_mode::explicit_;
+    report.has_key_mapping = mode_ == key_mode::keyed || mode_ == key_mode::undecided;
 
     if (!staging_->is_sorted()) {
       if (options_.order == input_order::assume_sorted) {
@@ -340,6 +462,27 @@ class table_builder {
       return;
     }
     if (mode_ != wanted) {
+      throw build_error(
+          "a build is either keyed or caller-split, not both: begin_record() and "
+          "begin_record_at() cannot be mixed");
+    }
+  }
+
+  /// As enter_mode, but also fixes the address width, which a wide build needs
+  /// before it can allocate its arena.
+  void enter_wide_mode(unsigned width) {
+    if (finished_) throw build_error("records added after finish()");
+    if (mode_ == key_mode::undecided) {
+      mode_ = key_mode::explicit_wide;
+      wide_width_ = width;
+      if (!staging_) {
+        auto owned = std::make_unique<blob_staging>(width);
+        blob_ = owned.get();
+        staging_ = std::move(owned);
+      }
+      return;
+    }
+    if (mode_ != key_mode::explicit_wide) {
       throw build_error(
           "a build is either keyed or caller-split, not both: begin_record() and "
           "begin_record_at() cannot be mixed");
@@ -415,10 +558,15 @@ class table_builder {
 
   void check_sorted_unique() const {
     for (std::uint64_t i = 1; i < staging_->size(); ++i) {
+      const bool same_partition = staging_->partition_at(i - 1) == staging_->partition_at(i);
+      const bool address_increases =
+          blob_ != nullptr
+              ? std::memcmp(staging_->address_bytes_at(i - 1).data(),
+                            staging_->address_bytes_at(i).data(), wide_width_) < 0
+              : staging_->address_at(i - 1) < staging_->address_at(i);
       const bool increasing =
           staging_->partition_at(i - 1) < staging_->partition_at(i) ||
-          (staging_->partition_at(i - 1) == staging_->partition_at(i) &&
-           staging_->address_at(i - 1) < staging_->address_at(i));
+          (same_partition && address_increases);
       if (!increasing) {
         throw build_error("duplicate key after sorting: (" +
                           std::to_string(staging_->partition_at(i)) + ", " +
@@ -529,7 +677,9 @@ class table_builder {
         i = j;
       }
     }
-    address_width_ = detail::width_for(max_address);
+    // A wide build already fixed its width; a narrow one takes the narrowest
+    // that holds the largest address seen.
+    address_width_ = blob_ != nullptr ? wide_width_ : detail::width_for(max_address);
 
     // The cost model. Dictionary bytes for text fields are the same either way,
     // so they cancel and only records plus the composite dictionary matter.
@@ -708,7 +858,12 @@ class table_builder {
           interned_ ? address_width_ + width : address_width_ + value_stride_;
       for (std::uint64_t k = i; k < j; ++k) {
         std::memset(record.data(), 0, stride);
-        detail::store_uint(record.data(), address_width_, staging_->address_at(k));
+        if (blob_ != nullptr) {
+          const auto bytes = staging_->address_bytes_at(k);
+          std::memcpy(record.data(), bytes.data(), bytes.size());
+        } else {
+          detail::store_uint(record.data(), address_width_, staging_->address_at(k));
+        }
         if (interned_) {
           const std::uint64_t global = staging_->tuple_at(k);
           const std::uint64_t ref = schema_id != remap::none ? to_local[global] : global;
@@ -802,7 +957,7 @@ class table_builder {
     // A caller-split build has no 64-bit key space to describe, and guessing a
     // shift from the observed addresses would produce keys that are ordered
     // correctly but are not the caller's.
-    head.address_bits = mode_ == key_mode::explicit_
+    head.address_bits = (mode_ == key_mode::explicit_ || mode_ == key_mode::explicit_wide)
                             ? no_key_mapping
                             : static_cast<std::uint8_t>(options_.address_bits);
     head.mode = static_cast<std::uint8_t>(interned_ ? value_mode::interned
@@ -842,6 +997,10 @@ class table_builder {
   std::uint64_t last_partition_ = 0;
   std::uint64_t last_address_ = 0;
   key_mode mode_ = key_mode::undecided;
+  blob_staging* blob_ = nullptr;  ///< non-null exactly in explicit_wide mode
+  unsigned wide_width_ = 0;
+  std::vector<std::byte> pending_address_;  ///< the open record's wide address
+  std::vector<std::byte> last_wide_;        ///< for the ordering check
   std::uint32_t value_stride_ = 0;
   std::uint32_t record_stride_ = 0;
   unsigned address_width_ = 1;

@@ -197,10 +197,42 @@ ipv6 back = kt.key(it);                      // only compiles with a join suppli
 Both are non-owning views that forward to the `_at` forms after an inlined
 split, so they cost nothing at runtime and the format never learns about them.
 
-**The one limit:** partition and address must each fit a `uint64`. The address is
-a fixed-width integer inside every record and is what the binary search compares.
-mmseek had the same constraint. So 128-bit keys work as 64/64; a key whose
-*address alone* exceeds 64 bits does not.
+### Addresses wider than 64 bits
+
+An address may be any fixed width. Past 8 bytes it stops being an integer and
+becomes an opaque byte string compared with `memcmp`:
+
+```cpp
+std::array<std::byte, 14> host;      // the low 112 bits of an IPv6 address
+tb.begin_record_at(prefix, std::span<const std::byte>(host));
+...
+t.find_at(prefix, std::span<const std::byte>(host));
+t.floor_at(prefix, std::span<const std::byte>(host));
+```
+
+**You must supply an order-preserving encoding**, because the library never
+interprets those bytes — it only compares them. Big endian is the usual answer,
+and IPv6 network order already is one, so it works unchanged. This is the same
+contract a split already carries.
+
+The width is fixed by the first such record and every later one must match; a
+uniform stride is what makes the binary search possible. `narrow_address()` says
+which regime an image is in, `iterator::address()` returns `std::nullopt` on a
+wide one, and `iterator::address_bytes()` is always valid. Each `*_at` form takes
+either an integer or a span: the span form serves both regimes, and the integer
+form finds nothing on a wide image, since the probe is not in its address space.
+
+Widths 3, 5, 6 and 7 are legal too — they were only ever excluded by a check that
+listed 1, 2, 4 and 8.
+
+**Wide addresses cost build memory**: staging carries 16 bytes plus the address
+width per record, so 290M records with a 14-byte address is roughly 8.7 GB
+against 4.6 GB for the narrow path. Only builds that use them pay it.
+
+**The partition stays a `uint64`, deliberately.** It is a bucket selector you
+choose, not key payload: a dense directory indexes *by* partition, so widening it
+would cost O(1) partition select and turn it into a `memcmp` binary search. Key
+payload belongs in the address, which is why that is the side with no cap.
 
 ## Searching
 

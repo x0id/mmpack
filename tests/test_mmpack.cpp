@@ -1,5 +1,6 @@
 // Self-contained test suite: no external framework, just CHECK macros.
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -1006,7 +1007,6 @@ void test_explicit_parts_wide_keys() {
     CHECK(it.address() == k.low);
     CHECK(t.uint(it, id).value() == v);
     CHECK(!it.key().has_value());  // no 64-bit key exists for this image
-    CHECK(*it == (mmpack::key_parts{k.high, k.low}));
   }
 
   // Iteration is in (partition, address) order, which is the key order.
@@ -1103,6 +1103,78 @@ void test_keyed_wrapper() {
   // without a join does not compile -- and `joinable` above records the intent.
 }
 
+void test_keyed_wrapper_wide() {
+  // The wrapper should carry a wide split with no changes of its own: the span
+  // overloads are picked by ordinary resolution.
+  struct v6 {
+    std::array<std::byte, 16> bytes{};
+    bool operator<(const v6& o) const { return bytes < o.bytes; }
+    bool operator==(const v6& o) const = default;
+  };
+  struct split_wide {
+    std::pair<std::uint64_t, std::span<const std::byte>> operator()(const v6& k) const {
+      // Partition on the first two bytes, address on the remaining fourteen.
+      const std::uint64_t p = (static_cast<std::uint64_t>(k.bytes[0]) << 8) |
+                              static_cast<std::uint64_t>(k.bytes[1]);
+      return {p, std::span<const std::byte>(k.bytes.data() + 2, 14)};
+    }
+  };
+  struct join_wide {
+    v6 operator()(std::uint64_t p, std::span<const std::byte> a) const {
+      v6 out{};
+      out.bytes[0] = static_cast<std::byte>((p >> 8) & 0xff);
+      out.bytes[1] = static_cast<std::byte>(p & 0xff);
+      std::memcpy(out.bytes.data() + 2, a.data(), a.size());
+      return out;
+    }
+  };
+
+  std::mt19937_64 rng(777);
+  std::vector<v6> keys;
+  for (int i = 0; i < 400; ++i) {
+    v6 k{};
+    for (std::size_t b = 0; b < k.bytes.size(); ++b) {
+      k.bytes[b] = static_cast<std::byte>(rng() & 0xff);
+    }
+    k.bytes[0] = static_cast<std::byte>(rng() % 8);  // a handful of partitions
+    keys.push_back(k);
+  }
+  std::sort(keys.begin(), keys.end());
+  keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+
+  mmpack::schema_builder sb2;
+  const auto vf = sb2.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb2, {});
+  mmpack::keyed_builder<v6, split_wide> kb(tb, split_wide{});
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    auto rec = kb.begin_record(keys[i]);
+    rec.set_uint(vf, i);
+    kb.commit(rec);
+  }
+  const auto report = tb.finish(sink);
+  CHECK(report.address_width == 14);
+  CHECK(!report.has_key_mapping);
+
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  const auto id = t.field("v").value();
+  const mmpack::keyed_table<v6, split_wide, join_wide> kt(t, split_wide{}, join_wide{});
+
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    const auto it = kt.find(keys[i]);
+    CHECK(it != kt.end());
+    if (it == kt.end()) continue;
+    CHECK(t.uint(it, id).value() == i);
+    CHECK(kt.key(it) == keys[i]);  // the join round-trips a 128-bit key
+  }
+  // floor through the wrapper on a key that is not stored.
+  v6 probe = keys[100];
+  probe.bytes[15] = std::byte{0x00};
+  const auto fl = kt.floor(probe);
+  CHECK(fl != kt.end());
+  if (fl != kt.end()) CHECK(!(probe < kt.key(fl)));
+}
+
 void test_key_modes() {
   mmpack::schema_builder sb;
   const auto f = sb.add_uint("v");
@@ -1165,8 +1237,8 @@ void test_key_modes() {
     const auto id = t.field("v").value();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> seen;
     for (auto it = t.begin(); it != t.end(); ++it) {
-      seen.push_back({it.partition(), it.address()});
-      CHECK(t.uint(it, id).value() == it.partition() * 100 + it.address());
+      seen.push_back({it.partition(), it.address().value()});
+      CHECK(t.uint(it, id).value() == it.partition() * 100 + it.address().value());
     }
     const std::vector<std::pair<std::uint64_t, std::uint64_t>> want{{2, 1}, {2, 5}, {9, 0}, {9, 1}};
     CHECK(seen == want);
@@ -1243,7 +1315,7 @@ void test_keyed_and_explicit_agree() {
     CHECK(ta.uint(ia, fa) == tb2.uint(ib, fb));
     CHECK(ia.key().has_value());
     CHECK(!ib.key().has_value());
-    CHECK(ia.key().value() == ((ia.partition() << bits) | ia.address()));
+    CHECK(ia.key().value() == ((ia.partition() << bits) | ia.address().value()));
   }
   CHECK(ia == ta.end());
   CHECK(ib == tb2.end());
@@ -1290,6 +1362,308 @@ void test_key_mapping_sentinel_rejected() {
   }
   {  // as is one just below the sentinel
     auto corrupt = patch_bits(0xfe);
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_schema);
+  }
+}
+
+// --- addresses wider than 64 bits -------------------------------------------
+
+using addr14 = std::array<std::byte, 14>;
+
+/// Big endian, so lexicographic byte order is numeric order -- the encoding
+/// contract wide addresses carry.
+addr14 make_addr(std::uint64_t hi, std::uint64_t lo) {
+  addr14 out{};
+  for (int i = 0; i < 6; ++i) out[i] = static_cast<std::byte>((hi >> (8 * (5 - i))) & 0xff);
+  for (int i = 0; i < 8; ++i) out[6 + i] = static_cast<std::byte>((lo >> (8 * (7 - i))) & 0xff);
+  return out;
+}
+
+std::span<const std::byte> as_span(const addr14& a) { return {a.data(), a.size()}; }
+
+void test_wide_addresses() {
+  // A /16 partition with a 14-byte host part: the address alone is 112 bits, so
+  // this is exactly the shape that did not fit before.
+  std::mt19937_64 rng(6060);
+  std::map<std::pair<std::uint64_t, addr14>, std::uint64_t> oracle;
+  for (std::uint64_t p = 0; p < 40; ++p) {
+    for (int i = 0; i < 25; ++i) oracle[{p, make_addr(rng(), rng())}] = rng() % 10000;
+  }
+
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, {});
+  for (const auto& [k, v] : oracle) {  // std::map orders by (partition, bytes)
+    auto rec = tb.begin_record_at(k.first, as_span(k.second));
+    rec.set_uint(f, v);
+    tb.commit(rec);
+  }
+  const auto report = tb.finish(sink);
+  CHECK(!report.has_key_mapping);
+  CHECK(report.address_width == 14);
+
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  CHECK(!t.narrow_address());
+  CHECK(t.address_width() == 14);
+  CHECK(t.size() == oracle.size());
+  const auto id = t.field("v").value();
+
+  for (const auto& [k, v] : oracle) {
+    const auto it = t.find_at(k.first, as_span(k.second));
+    CHECK(it != t.end());
+    if (it == t.end()) continue;
+    CHECK(it.partition() == k.first);
+    CHECK(!it.address().has_value());  // does not fit an integer
+    const auto bytes = it.address_bytes();
+    CHECK(bytes.size() == 14);
+    CHECK(std::memcmp(bytes.data(), k.second.data(), 14) == 0);
+    CHECK(t.uint(it, id).value() == v);
+  }
+
+  auto want = oracle.begin();
+  for (auto it = t.begin(); it != t.end(); ++it, ++want) {
+    CHECK(it.partition() == want->first.first);
+    CHECK(std::memcmp(it.address_bytes().data(), want->first.second.data(), 14) == 0);
+  }
+
+  for (int i = 0; i < 3000; ++i) {
+    const std::uint64_t p = rng() % 42;
+    const addr14 probe = make_addr(rng(), rng());
+    const auto got = t.floor_at(p, as_span(probe));
+    const auto above = oracle.upper_bound({p, probe});
+    if (above == oracle.begin()) {
+      CHECK(got == t.end());
+    } else {
+      const auto expect = std::prev(above);
+      CHECK(got != t.end());
+      if (got != t.end()) {
+        CHECK(got.partition() == expect->first.first);
+        CHECK(std::memcmp(got.address_bytes().data(), expect->first.second.data(), 14) == 0);
+      }
+    }
+  }
+
+  // The integer forms have nothing to search on a wide image, and a probe of the
+  // wrong length is refused rather than compared short.
+  CHECK(t.find_at(0, std::uint64_t{0}) == t.end());
+  CHECK(t.lower_bound_at(0, std::uint64_t{0}) == t.end());
+  CHECK(t.floor_at(0, ~std::uint64_t{0}) == t.end());
+  const std::array<std::byte, 13> short_probe{};
+  CHECK(t.find_at(0, std::span<const std::byte>(short_probe)) == t.end());
+  CHECK(t.floor_at(0, std::span<const std::byte>(short_probe)) == t.end());
+}
+
+void test_wide_address_ordering_is_lexicographic() {
+  // Chosen so a little-endian integer reading would order them the other way
+  // round, which is what proves the comparison is memcmp on the bytes.
+  addr14 a{};
+  a[13] = std::byte{0x01};
+  addr14 b{};
+  b[12] = std::byte{0x01};
+  addr14 c{};
+  c[0] = std::byte{0x01};
+  const std::vector<addr14> keys = {a, b, c};
+
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, {});
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    auto rec = tb.begin_record_at(0, as_span(keys[i]));
+    rec.set_uint(f, i);
+    tb.commit(rec);
+  }
+  tb.finish(sink);
+
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  const auto id = t.field("v").value();
+  std::vector<std::uint64_t> order;
+  for (auto it = t.begin(); it != t.end(); ++it) order.push_back(t.uint(it, id).value());
+  CHECK((order == std::vector<std::uint64_t>{0, 1, 2}));
+
+  addr14 probe = b;
+  probe[13] = std::byte{0xff};  // between b and c lexicographically
+  const auto fl = t.floor_at(0, as_span(probe));
+  CHECK(fl != t.end());
+  if (fl != t.end()) CHECK(t.uint(fl, id).value() == 1);
+}
+
+void test_wide_address_build_errors() {
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  const addr14 wide{};
+  {  // a second record of a different width breaks the fixed stride
+    mmpack::table_builder tb(sb, {});
+    auto a = tb.begin_record_at(0, as_span(wide));
+    a.set_uint(f, 1);
+    tb.commit(a);
+    const std::array<std::byte, 10> other{};
+    CHECK_THROWS(tb.begin_record_at(0, std::span<const std::byte>(other)), mmpack::build_error);
+  }
+  {  // an empty address has nothing to order by
+    mmpack::table_builder tb(sb, {});
+    CHECK_THROWS(tb.begin_record_at(0, std::span<const std::byte>()), mmpack::build_error);
+  }
+  {  // wide and integer forms are different modes and cannot be mixed
+    mmpack::table_builder tb(sb, {});
+    auto a = tb.begin_record_at(0, as_span(wide));
+    a.set_uint(f, 1);
+    tb.commit(a);
+    CHECK_THROWS(tb.begin_record_at(1, std::uint64_t{2}), mmpack::build_error);
+  }
+  {
+    mmpack::table_builder tb(sb, {});
+    auto a = tb.begin_record_at(0, std::uint64_t{1});
+    a.set_uint(f, 1);
+    tb.commit(a);
+    CHECK_THROWS(tb.begin_record_at(0, as_span(wide)), mmpack::build_error);
+  }
+  {  // out-of-order and duplicate wide addresses are caught as narrow ones are
+    mmpack::table_builder tb(sb, {});
+    auto a = tb.begin_record_at(0, as_span(make_addr(5, 5)));
+    a.set_uint(f, 1);
+    tb.commit(a);
+    auto b = tb.begin_record_at(0, as_span(make_addr(5, 4)));
+    b.set_uint(f, 2);
+    CHECK_THROWS(tb.commit(b), mmpack::build_error);
+  }
+  {
+    mmpack::table_builder tb(sb, {});
+    auto a = tb.begin_record_at(0, as_span(make_addr(5, 5)));
+    a.set_uint(f, 1);
+    tb.commit(a);
+    auto b = tb.begin_record_at(0, as_span(make_addr(5, 5)));
+    b.set_uint(f, 2);
+    CHECK_THROWS(tb.commit(b), mmpack::build_error);
+  }
+  {  // sort_if_needed recovers unordered wide input
+    mmpack::build_options o;
+    o.order = mmpack::input_order::sort_if_needed;
+    mmpack::table_builder tb(sb, o);
+    for (std::uint64_t v : {30ull, 10ull, 20ull}) {
+      auto rec = tb.begin_record_at(0, as_span(make_addr(0, v)));
+      rec.set_uint(f, v);
+      tb.commit(rec);
+    }
+    mmpack::vector_sink sink;
+    const auto rep = tb.finish(sink);
+    CHECK(rep.sorted_during_finish);
+    const auto t = mmpack::table::open(sink.data(), sink.size());
+    const auto id = t.field("v").value();
+    std::vector<std::uint64_t> seen;
+    for (auto it = t.begin(); it != t.end(); ++it) seen.push_back(t.uint(it, id).value());
+    CHECK((seen == std::vector<std::uint64_t>{10, 20, 30}));
+  }
+}
+
+void test_odd_narrow_widths() {
+  // 3, 5, 6 and 7 were only excluded by the old {1,2,4,8} check; the integer
+  // path already handled them.
+  for (const std::uint64_t top :
+       {std::uint64_t{0xffffff}, std::uint64_t{0xffffffffff}, std::uint64_t{0xffffffffffff},
+        std::uint64_t{0xffffffffffffff}}) {
+    mmpack::schema_builder sb;
+    const auto f = sb.add_uint("v");
+    mmpack::vector_sink sink;
+    mmpack::table_builder tb(sb, {});
+    for (std::uint64_t i = 0; i < 8; ++i) {
+      auto rec = tb.begin_record_at(0, top - (7 - i));
+      rec.set_uint(f, i);
+      tb.commit(rec);
+    }
+    const auto rep = tb.finish(sink);
+    const auto t = mmpack::table::open(sink.data(), sink.size());
+    CHECK(t.narrow_address());
+    CHECK(t.address_width() == rep.address_width);
+    const auto id = t.field("v").value();
+    for (std::uint64_t i = 0; i < 8; ++i) {
+      const auto it = t.find_at(0, top - (7 - i));
+      CHECK(it != t.end());
+      if (it != t.end()) {
+        CHECK(t.uint(it, id).value() == i);
+        CHECK(it.address().value() == top - (7 - i));
+      }
+    }
+  }
+}
+
+void test_span_overload_on_narrow_images() {
+  // The span form is the general one and must serve narrow images too, so a
+  // caller need not branch on the width.
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::build_options o;
+  o.address_bits = 8;
+  mmpack::table_builder tb(sb, o);
+  for (std::uint64_t a = 0; a < 20; ++a) {
+    auto rec = tb.begin_record((1ull << 8) | (a * 3));
+    rec.set_uint(f, a);
+    tb.commit(rec);
+  }
+  tb.finish(sink);
+
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  CHECK(t.narrow_address());
+  const auto id = t.field("v").value();
+  const unsigned width = t.address_width();
+
+  for (std::uint64_t a = 0; a < 20; ++a) {
+    std::array<std::byte, 8> probe{};
+    const std::uint64_t value = a * 3;
+    std::memcpy(probe.data(), &value, sizeof(value));
+    const std::span<const std::byte> as_bytes(probe.data(), width);
+
+    const auto by_int = t.find_at(1, value);
+    const auto by_span = t.find_at(1, as_bytes);
+    CHECK(by_int != t.end());
+    CHECK(by_int == by_span);
+    if (by_span != t.end()) CHECK(t.uint(by_span, id).value() == a);
+    CHECK(t.floor_at(1, value) == t.floor_at(1, as_bytes));
+    CHECK(t.lower_bound_at(1, value) == t.lower_bound_at(1, as_bytes));
+  }
+  const std::array<std::byte, 7> wrong{};
+  CHECK(t.find_at(1, std::span<const std::byte>(wrong)) == t.end());
+}
+
+void test_wide_address_corruption() {
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, {});
+  for (std::uint64_t i = 0; i < 30; ++i) {
+    auto rec = tb.begin_record_at(0, as_span(make_addr(0, i)));
+    rec.set_uint(f, i);
+    tb.commit(rec);
+  }
+  tb.finish(sink);
+  const auto image = sink.bytes();
+  mmpack::status s = mmpack::status::ok;
+
+  const auto patch_schema = [&](auto mutate) {
+    auto corrupt = image;
+    const auto foot = mmpack::detail::load<mmpack::footer>(
+        corrupt.data() + corrupt.size() - sizeof(mmpack::footer));
+    auto head = mmpack::detail::load<mmpack::schema_header>(corrupt.data() + foot.schema_offset);
+    mutate(head);
+    mmpack::detail::store(corrupt.data() + foot.schema_offset, head);
+    return corrupt;
+  };
+
+  {  // an address wider than the record that holds it
+    auto corrupt = patch_schema([](mmpack::schema_header& h) { h.address_width = 200; });
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_schema);
+  }
+  {  // a zero-width address has nothing to compare
+    auto corrupt = patch_schema([](mmpack::schema_header& h) { h.address_width = 0; });
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_schema);
+  }
+  {  // a key mapping cannot coexist with an address too wide to pack into one
+    auto corrupt = patch_schema([](mmpack::schema_header& h) { h.address_bits = 16; });
     CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
     CHECK(s == mmpack::status::bad_schema);
   }
@@ -1699,9 +2073,16 @@ int main() {
   run("partition remap is selective", test_partition_remap_is_selective);
   run("explicit parts, wide keys", test_explicit_parts_wide_keys);
   run("keyed wrapper", test_keyed_wrapper);
+  run("keyed wrapper, wide", test_keyed_wrapper_wide);
   run("key modes", test_key_modes);
   run("keyed and explicit agree", test_keyed_and_explicit_agree);
   run("key mapping sentinel", test_key_mapping_sentinel_rejected);
+  run("wide addresses", test_wide_addresses);
+  run("wide address ordering is lexicographic", test_wide_address_ordering_is_lexicographic);
+  run("wide address build errors", test_wide_address_build_errors);
+  run("odd narrow widths", test_odd_narrow_widths);
+  run("span overload on narrow images", test_span_overload_on_narrow_images);
+  run("wide address corruption", test_wide_address_corruption);
   run("directory is narrowed", test_directory_is_narrowed);
   run("remap corruption", test_remap_corruption);
   run("rejects bad images", test_rejects_bad_images);

@@ -194,7 +194,10 @@ class schema_view {
         sizeof(schema_header) + fields_bytes + dicts_bytes + head.name_bytes;
     if (total > block.size()) return std::nullopt;
 
-    if (!detail::is_valid_width(head.address_width)) return std::nullopt;
+    // Any width from 1 byte up is legal. Up to 8 the address is an integer and
+    // compares as one; beyond that it is an opaque byte string compared
+    // lexicographically. The record-stride check below bounds it for real.
+    if (head.address_width == 0) return std::nullopt;
     if (head.address_bits > 64 && head.address_bits != no_key_mapping) return std::nullopt;
 
     // The directory widths gate every later bounds check, so they are validated
@@ -279,6 +282,11 @@ class schema_view {
   [[nodiscard]] std::uint32_t record_stride() const noexcept { return head_.record_stride; }
   [[nodiscard]] std::uint32_t value_stride() const noexcept { return head_.value_stride; }
   [[nodiscard]] unsigned address_width() const noexcept { return head_.address_width; }
+
+  /// Whether the address fits an integer. Narrow addresses compare numerically
+  /// and are stored native-endian; wide ones are opaque bytes compared
+  /// lexicographically, which is why their encoding has to be order-preserving.
+  [[nodiscard]] bool narrow_address() const noexcept { return head_.address_width <= 8; }
   [[nodiscard]] unsigned address_bits() const noexcept { return head_.address_bits; }
   [[nodiscard]] unsigned ref_width() const noexcept { return head_.ref_width; }
   [[nodiscard]] std::uint32_t value_dict() const noexcept { return head_.value_dict; }

@@ -12,6 +12,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <array>
 #include <cstring>
 #include <random>
 #include <string>
@@ -56,7 +57,7 @@ std::vector<std::byte> valid_image(std::mt19937_64& rng, fields& ids,
   // Half the images are built from caller-split parts, so they carry the
   // no-key-mapping sentinel and reach the nullopt paths on key() and on the
   // key-taking lookups.
-  const bool split_keys = (rng() % 2) != 0;
+  const int key_style = static_cast<int>(rng() % 3);  // 0 keyed, 1 split, 2 wide
   // Enough records and enough distinct tuples that the global reference is
   // sometimes 2 bytes wide, which is what lets partitions actually remap.
   const int n = 1 + static_cast<int>(rng() % 3000);
@@ -66,8 +67,17 @@ std::vector<std::byte> valid_image(std::mt19937_64& rng, fields& ids,
     key += 1 + rng() % 40;
     const unsigned t = static_cast<unsigned>(rng() % tuple_space);
     const unsigned bits = options.address_bits;
-    auto rec = split_keys ? tb.begin_record_at(key >> bits, key & ((1ull << bits) - 1))
-                          : tb.begin_record(key);
+    // A wide address is the low bits written big-endian into 12 bytes, so it
+    // stays ordered and drives the memcmp search path.
+    std::array<std::byte, 12> wide{};
+    for (int b = 0; b < 8; ++b) {
+      wide[4 + b] = static_cast<std::byte>((key >> (8 * (7 - b))) & 0xff);
+    }
+    auto rec = key_style == 2
+                   ? tb.begin_record_at(0, std::span<const std::byte>(wide))
+               : key_style == 1
+                   ? tb.begin_record_at(key >> bits, key & ((1ull << bits) - 1))
+                   : tb.begin_record(key);
     rec.set_text(ids.country, countries[t % 5]);
     rec.set_text(ids.region, "region-" + std::to_string(t % 4));
     rec.set_uint(ids.population, 1000 + t);
@@ -88,9 +98,10 @@ std::uint64_t exercise(const mmpack::table& t, const fields& ids) {
 
   sink += t.has_key_mapping() ? 1 : 0;
   for (auto it = t.begin(); it != t.end(); ++it) {
-    sink += it.partition() + it.address();
+    sink += it.partition();
+    if (const auto a = it.address()) sink += *a;
+    for (const std::byte b : it.address_bytes()) sink += static_cast<std::uint64_t>(b);
     if (const auto k = it.key()) sink += *k;  // empty on caller-split images
-    sink += (*it).partition;
     if (auto v = t.uint(it, ids.population)) sink += *v;
     if (auto v = t.sint(it, ids.temp)) sink += static_cast<std::uint64_t>(*v);
     // Bit-cast rather than value-cast: corrupted bytes decode to arbitrary
@@ -106,7 +117,7 @@ std::uint64_t exercise(const mmpack::table& t, const fields& ids) {
   auto it = t.end();
   while (it != t.begin()) {
     --it;
-    sink += it.address();
+    if (const auto a = it.address()) sink += *a;
   }
 
   // Field ids that may not exist in a corrupted schema, plus wild ones.
@@ -126,7 +137,7 @@ std::uint64_t exercise(const mmpack::table& t, const fields& ids) {
     probe = probe * 6364136223846793005ull + 1442695040888963407ull;
     for (const std::uint64_t k : {probe, probe >> 32, std::uint64_t{0}, ~std::uint64_t{0}}) {
       if (auto lb = t.lower_bound(k); lb != t.end()) sink += lb.key().value_or(0);
-      if (auto ub = t.upper_bound(k); ub != t.end()) sink += ub.address();
+      if (auto ub = t.upper_bound(k); ub != t.end()) sink += ub.address().value_or(0);
       if (auto f = t.find(k); f != t.end()) sink += f.key().value_or(0);
       sink += t.contains(k) ? 1 : 0;
       // floor() walks directory slots backwards, which no other entry point
@@ -135,9 +146,9 @@ std::uint64_t exercise(const mmpack::table& t, const fields& ids) {
         sink += fl.key().value_or(0);
         if (auto v = t.uint(fl, ids.population)) sink += *v;
       }
-      if (auto ce = t.ceil(k); ce != t.end()) sink += ce.address();
-      if (auto fl = t.floor_at(k >> 8, k & 0xff); fl != t.end()) sink += fl.address();
-      if (auto ce = t.ceil_at(k >> 8, k & 0xff); ce != t.end()) sink += ce.address();
+      if (auto ce = t.ceil(k); ce != t.end()) sink += ce.address().value_or(0);
+      if (auto fl = t.floor_at(k >> 8, k & 0xff); fl != t.end()) sink += fl.address().value_or(0);
+      if (auto ce = t.ceil_at(k >> 8, k & 0xff); ce != t.end()) sink += ce.address().value_or(0);
     }
   }
   return sink;

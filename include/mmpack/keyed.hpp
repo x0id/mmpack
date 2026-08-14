@@ -86,11 +86,20 @@ class keyed_table {
   /// Templated on a defaulted parameter rather than constrained directly, so
   /// that its absence is a substitution failure a `requires` expression can
   /// detect, instead of a hard error.
+  ///
+  /// The join is offered whichever address form it accepts: an integer for
+  /// images whose addresses fit one, the raw bytes otherwise. A join written for
+  /// wide keys therefore works unchanged on a narrow image and vice versa,
+  /// provided it takes the form that image actually has.
   template <class J = Join>
   [[nodiscard]] Key key(const const_iterator& it) const
     requires(!std::is_same_v<J, no_join>)
   {
-    return join_(it.partition(), it.address());
+    if constexpr (std::is_invocable_r_v<Key, const J&, std::uint64_t, std::uint64_t>) {
+      return join_(it.partition(), it.address().value());
+    } else {
+      return join_(it.partition(), it.address_bytes());
+    }
   }
 
  private:
