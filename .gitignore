@@ -1,0 +1,10 @@
+build/
+cmake-build-*/
+.cache/
+
+# Machine-specific absolute paths; regenerate with cmake or by hand.
+compile_commands.json
+
+*.o
+*.bin
+.DS_Store

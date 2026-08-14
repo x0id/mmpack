@@ -1,0 +1,232 @@
+# mmpack
+
+Header-only C++20 library for `lower_bound`-style key → record lookups over a
+read-only, memory-mapped image — with the **record shape computed from the data**
+rather than declared at compile time.
+
+You cannot know how many distinct countries there are, whether a population fits
+in two bytes, or how often whole records repeat, until the input has been
+consumed. mmpack measures first and lays out afterwards, then records the shape
+in the image so the reader can follow it.
+
+```cpp
+#include <mmpack/mmpack.hpp>
+
+mmpack::schema_builder sb;
+const auto city = sb.add_text("city");        // interned; index width chosen later
+const auto pop  = sb.add_uint("population");  // width and bias chosen from the range
+
+mmpack::table_builder tb(sb, {.address_bits = 16});
+for (const auto& row : rows) {                // keys must arrive in order
+  auto rec = tb.begin_record(row.key);
+  rec.set_text(city, row.city);
+  rec.set_uint(pop, row.population);
+  tb.commit(rec);
+}
+mmpack::vector_sink sink;
+const mmpack::build_report report = tb.finish(sink);
+
+const auto t = mmpack::table::open(sink.data(), report.image_bytes);
+const auto it = t.find(key);
+if (it != t.end()) {
+  std::string_view name = t.text(it, city).value_or("?");
+  std::uint64_t people  = t.uint(it, pop).value_or(0);
+}
+```
+
+## What the compaction buys
+
+Two independent mechanisms, both driven by measurement.
+
+**Per-field compaction.** Every integer field records its min and max, and is
+stored as `value - bias` in the narrowest width that fits the range. Magnitude is
+irrelevant; only the span matters. Text fields are interned and stored as an
+index whose width follows the cardinality.
+
+**Whole-value interning.** The entire value tuple is deduplicated and the record
+holds one reference into a composite dictionary. This catches repeated
+*combinations* that per-field compaction cannot see — correlated fields (city
+implies region implies country) still cost one index each under per-field alone,
+versus one reference under interning.
+
+From `examples/ipv4_routes.cpp`, 500k routes over 3000 distinct value tuples:
+
+```
+derived record shape (value tuple = 7 bytes):
+  next_hop   uint  offset  0  width 2  bias 167772160
+  asn        uint  offset  2  width 2  bias 64500
+  metric     uint  offset  4  width 1  bias 10
+  interface  text  offset  5  width 1  bias 0
+  region     text  offset  6  width 1  bias 0
+
+layout            bytes   stride     /entry     ns/query
+naive          23970000       48       48.0            -
+inline          4625941        9        9.3         45.3
+interned        2150101        4        4.3         41.0
+```
+
+`naive` is what a fixed-width struct with inline 16-byte strings would cost. The
+`next_hop` line is the bias at work: values around 0.17 billion, stored in two
+bytes, because they only span a narrow range.
+
+## The interning cost model
+
+Interning is decided automatically at `finish()` and pays when
+
+```
+(N - U) * V  >  N * R
+```
+
+for N records, U distinct values, V the compacted value stride and R the
+reference width implied by U. The decision and every input to it come back in the
+`build_report`, so it is auditable rather than magic;
+`build_options.value_interning` overrides it with `always` / `never`.
+
+**It is not always a win.** Sweeping the duplication ratio over the same 500k
+routes:
+
+| records | distinct | ratio | inline MB | intern MB | ns inline | ns intern | auto picks |
+|---|---|---|---|---|---|---|---|
+| 499375 | 1000 | 499.4x | 4.63 | 2.14 | 45.3 | 41.0 | interned |
+| 499375 | 10000 | 49.9x | 4.63 | 2.20 | 46.4 | 42.2 | interned |
+| 499375 | 99307 | 5.0x | 4.63 | 3.82 | 45.6 | 44.2 | interned |
+| 499375 | 285218 | 1.8x | 4.63 | **5.12** | 45.4 | 45.3 | inline |
+
+Below roughly 2x duplication, forced interning makes the image *larger* — the
+dictionary costs more than the references save. That last row is exactly what the
+cost model exists to prevent.
+
+Two caveats on the timings, so they are not read as more than they are. The
+lookup deltas above are within noise: at 500k records every dictionary still fits
+in cache, so this sweep never reaches the regime where the extra indirection
+becomes a DRAM miss. Expect interning to cost lookup time once the value
+dictionary outgrows cache. And **sequential scans get worse under interning
+regardless of size**, since iterating in key order touches the dictionary
+randomly — scan-heavy workloads should set `value_interning = never`.
+
+## Fields
+
+| kind | stored as | width |
+|---|---|---|
+| `add_uint` | `value - min` | 1/2/4/8, from the range |
+| `add_sint` | `value - min`, unsigned | 1/2/4/8, from the range |
+| `add_f32` / `add_f64` | IEEE bit pattern | 4 / 8 |
+| `add_text` | dictionary index | 1/2/4/8, from cardinality |
+| `add_bytes` | raw, inline | 1..8, declared |
+
+`bytes` is capped at 8 because it is read through the same runtime-width path as
+the numeric kinds. Anything longer belongs in a `text` field, which handles
+arbitrary length and deduplicates as well.
+
+Reads are `optional`-returning and kind-checked: `t.uint(it, id)` on a text field
+gives `nullopt`, never a reinterpretation. Fields are addressed by id, or looked
+up by name — the image carries its own field names, so it is self-describing.
+
+## Input ordering
+
+Input is **expected to arrive key-sorted**. `commit()` checks each key against
+the previous one, which is O(1) and makes duplicate rejection fall out of the
+same comparison. That removes a multi-gigabyte sort from large builds.
+
+- `input_order::assume_sorted` (default) — throws naming both keys.
+- `input_order::sort_if_needed` — tolerates disorder and sorts during `finish()`.
+  Opt-in, because at scale that cost should be a deliberate choice.
+
+## Build memory
+
+The builder stages every record before it can choose widths, so build memory is
+O(records):
+
+| | |
+|---|---|
+| staging, 16 bytes per record | `16 N` |
+| tuple table | `U * fields * 8` |
+| dedup hash index | ~`24 U` |
+
+For 290M records over 60M distinct tuples that is roughly 7 GB. Interning runs
+during staging regardless of the final decision, because storing a tuple id
+instead of every field value is what keeps staging small; if the distinct ratio
+stays above `dedup_give_up_ratio` after `dedup_sample` records, the hash index is
+dropped rather than paid for.
+
+`record_staging` is an interface so this can be replaced. Because input is
+already ordered and re-readable, the natural escape hatch is a two-pass builder
+— pass 1 interns and measures, pass 2 re-reads and streams records — rather than
+spilling to disk.
+
+## Format
+
+```
+[header 16B]
+[dictionaries]            text dictionaries, then the composite value dictionary
+[partition 0 records][partition 1 records]...
+[directory]
+[schema]                  field descriptors, dictionary table, name blob
+[footer 64B]
+```
+
+The directory, schema and footer sit at the end so the writer never seeks:
+partition offsets are only known after their records are emitted, and the schema
+is only final once the data has been measured. The reader finds the footer at
+`base + length - 64` and works backwards.
+
+A record is `[address][value]`. The address comes first at a fixed width so the
+binary search never consults the schema. The value is either the fields inline,
+or one reference into the composite dictionary:
+
+- inline: `base = record + address_width`
+- interned: `base = value_dict + load(record + address_width, ref_width) * value_stride`
+
+Lookup is two steps as ever: select the partition (O(1) when partition indices
+are dense, O(log P) when sparse), then binary search the fixed-stride records.
+Key splitting is runtime configuration — `partition = key >> address_bits` — with
+`lower_bound_at(partition, address)` available for keys that split differently.
+
+`length` must be the **exact** image size. The footer is found by counting back
+from the end, so a region with trailing slack is rejected rather than misread.
+
+### Untrusted images
+
+The schema is itself parsed from untrusted bytes, so a bad field offset or width
+would turn every record access into an out-of-bounds read. `try_open` proves the
+schema self-consistent — widths legal for the kind, every field inside the value
+tuple, names NUL-terminated inside the blob, dictionary indices in range — and
+validates the directory and every dictionary, before any accessor is built. A
+value reference past the composite dictionary yields `nullopt`, not a wild read.
+
+`tests/fuzz_open.cpp` is the evidence rather than the assertion: it corrupts
+valid images with bytes aimed at the schema, the directory and the records, then
+fully exercises every survivor under ASan.
+
+## Building
+
+Header-only — copy `include/` and add it to your include path, or:
+
+```cmake
+add_subdirectory(mmpack)
+target_link_libraries(my_app PRIVATE mmpack::mmpack)
+```
+
+Without cmake:
+
+```
+make test      # unit tests
+make check     # unit tests + corruption fuzzer, under ASan/UBSan
+make example   # the routing example, end to end with a real mmap
+```
+
+Requires C++20. Tested with Apple Clang 14 on arm64.
+
+## Limits
+
+- **Little-endian hosts only**, enforced by a `static_assert`. Runtime-width
+  access reads exactly `width` bytes, which only matches the native integer
+  layout on little-endian; a big-endian build would silently produce wrong
+  values for the odd widths, so it refuses to compile instead.
+- **No compile-time type safety.** Field access is by id with runtime kind
+  checks; a wrong `uint` vs `text` call is a `nullopt`, not a build error.
+- **Runtime stride and field offsets** cost some lookup throughput against a
+  compile-time layout. That is the trade this project exists to make.
+- **One schema per image.** `dir_entry` reserves a `schema_id` so per-partition
+  shapes can be added later without a format break.
+- **Iterators borrow the table**, which borrows the mapping. Keep both alive.
