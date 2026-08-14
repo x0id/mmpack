@@ -8,3 +8,8 @@ compile_commands.json
 *.o
 *.bin
 .DS_Store
+
+# Editor swap files.
+*.swp
+*.swo
+*~

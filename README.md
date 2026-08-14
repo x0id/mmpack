@@ -138,6 +138,70 @@ dictionary outgrows cache. And **sequential scans get worse under interning
 regardless of size**, since iterating in key order touches the dictionary
 randomly — scan-heavy workloads should set `value_interning = never`.
 
+## Keys
+
+mmpack stores two ordering coordinates per record — a **partition** and an
+**address**, both `uint64` — and nothing else. A 64-bit key is only a packing of
+them, so any key type of any width works as long as you can split it.
+
+**Keyed builds** take the packing for you, splitting a `uint64` by
+`address_bits`:
+
+```cpp
+mmpack::table_builder tb(sb, {.address_bits = 16});
+tb.begin_record(ipv4);              // partition = ipv4 >> 16, address = ipv4 & 0xffff
+...
+t.find(ipv4);  t.floor(ipv4);       // and the key-taking lookups work
+```
+
+**Caller-split builds** take the coordinates directly, which is what lets a key
+be wider than 64 bits or not a number at all:
+
+```cpp
+tb.begin_record_at(v6.high, v6.low);   // a 128-bit key, split 64/64
+...
+t.find_at(v6.high, v6.low);  t.floor_at(v6.high, v6.low);
+```
+
+A build is one or the other, fixed by its first record; mixing throws. Ordering
+is checked on `(partition, address)` either way, so duplicates still fall out of
+the same comparison.
+
+**A caller-split image reports no key mapping**, and `iterator::key()` returns
+`std::nullopt` there. That is deliberate rather than a missing feature: the
+library does not know your encoding. Split an IPv4 as (high 16, low 16) but never
+store an address above 1000, and a key synthesized from the observed range would
+be `(p << 10) | a` — correctly ordered, and not your key. The key-taking lookups
+likewise find nothing on such an image; `has_key_mapping()` distinguishes that
+from a genuine miss.
+
+### Typed keys without the boilerplate
+
+`mmpack/keyed.hpp` holds the split once instead of at each call site. `Join` is
+optional and gates `key()`, the same way mmseek's `join_key` gated it through
+`joinable_traits`:
+
+```cpp
+struct split_v6 { std::pair<std::uint64_t, std::uint64_t> operator()(const ipv6& k) const
+                  { return {k.high, k.low}; } };
+struct join_v6  { ipv6 operator()(std::uint64_t p, std::uint64_t a) const { return {p, a}; } };
+
+mmpack::keyed_builder<ipv6, split_v6> kb(tb, split_v6{});
+auto rec = kb.begin_record(addr);            // splits, then begin_record_at
+
+mmpack::keyed_table<ipv6, split_v6, join_v6> kt(t, split_v6{}, join_v6{});
+auto it = kt.floor(addr);
+ipv6 back = kt.key(it);                      // only compiles with a join supplied
+```
+
+Both are non-owning views that forward to the `_at` forms after an inlined
+split, so they cost nothing at runtime and the format never learns about them.
+
+**The one limit:** partition and address must each fit a `uint64`. The address is
+a fixed-width integer inside every record and is what the binary search compares.
+mmseek had the same constraint. So 128-bit keys work as 64/64; a key whose
+*address alone* exceeds 64 bits does not.
+
 ## Searching
 
 | method | returns |

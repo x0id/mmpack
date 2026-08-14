@@ -53,6 +53,10 @@ std::vector<std::byte> valid_image(std::mt19937_64& rng, fields& ids,
   options.partition_remap = (rng() % 2) != 0;
 
   mmpack::table_builder tb(sb, options);
+  // Half the images are built from caller-split parts, so they carry the
+  // no-key-mapping sentinel and reach the nullopt paths on key() and on the
+  // key-taking lookups.
+  const bool split_keys = (rng() % 2) != 0;
   // Enough records and enough distinct tuples that the global reference is
   // sometimes 2 bytes wide, which is what lets partitions actually remap.
   const int n = 1 + static_cast<int>(rng() % 3000);
@@ -61,7 +65,9 @@ std::vector<std::byte> valid_image(std::mt19937_64& rng, fields& ids,
   for (int i = 0; i < n; ++i) {
     key += 1 + rng() % 40;
     const unsigned t = static_cast<unsigned>(rng() % tuple_space);
-    auto rec = tb.begin_record(key);
+    const unsigned bits = options.address_bits;
+    auto rec = split_keys ? tb.begin_record_at(key >> bits, key & ((1ull << bits) - 1))
+                          : tb.begin_record(key);
     rec.set_text(ids.country, countries[t % 5]);
     rec.set_text(ids.region, "region-" + std::to_string(t % 4));
     rec.set_uint(ids.population, 1000 + t);
@@ -80,8 +86,11 @@ std::vector<std::byte> valid_image(std::mt19937_64& rng, fields& ids,
 std::uint64_t exercise(const mmpack::table& t, const fields& ids) {
   std::uint64_t sink = 0;
 
+  sink += t.has_key_mapping() ? 1 : 0;
   for (auto it = t.begin(); it != t.end(); ++it) {
-    sink += it.key() + it.partition() + it.address();
+    sink += it.partition() + it.address();
+    if (const auto k = it.key()) sink += *k;  // empty on caller-split images
+    sink += (*it).partition;
     if (auto v = t.uint(it, ids.population)) sink += *v;
     if (auto v = t.sint(it, ids.temp)) sink += static_cast<std::uint64_t>(*v);
     // Bit-cast rather than value-cast: corrupted bytes decode to arbitrary
@@ -116,14 +125,14 @@ std::uint64_t exercise(const mmpack::table& t, const fields& ids) {
   for (int i = 0; i < 200; ++i) {
     probe = probe * 6364136223846793005ull + 1442695040888963407ull;
     for (const std::uint64_t k : {probe, probe >> 32, std::uint64_t{0}, ~std::uint64_t{0}}) {
-      if (auto lb = t.lower_bound(k); lb != t.end()) sink += lb.key();
+      if (auto lb = t.lower_bound(k); lb != t.end()) sink += lb.key().value_or(0);
       if (auto ub = t.upper_bound(k); ub != t.end()) sink += ub.address();
-      if (auto f = t.find(k); f != t.end()) sink += f.key();
+      if (auto f = t.find(k); f != t.end()) sink += f.key().value_or(0);
       sink += t.contains(k) ? 1 : 0;
       // floor() walks directory slots backwards, which no other entry point
       // does, so a corrupt directory has to be aimed at it directly.
       if (auto fl = t.floor(k); fl != t.end()) {
-        sink += fl.key();
+        sink += fl.key().value_or(0);
         if (auto v = t.uint(fl, ids.population)) sink += *v;
       }
       if (auto ce = t.ceil(k); ce != t.end()) sink += ce.address();

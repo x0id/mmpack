@@ -63,6 +63,15 @@ enum class value_mode : std::uint8_t {
 
 inline constexpr std::uint32_t schema_magic = 0x4d534348u;  // 'MSCH'
 
+/// address_bits value meaning "this image has no 64-bit key mapping": its
+/// records were written from partition/address pairs the caller split by rules
+/// the library never saw, so there is nothing to reconstruct a key from.
+///
+/// A real shift is 0..64, so 0xff was already an invalid value. That is what
+/// makes this safe to add without moving the format: an older reader rejects it
+/// on the existing range check rather than mistaking it for a shift.
+inline constexpr std::uint8_t no_key_mapping = 0xff;
+
 struct schema_header {
   std::uint32_t magic;
   std::uint32_t field_count;
@@ -186,7 +195,7 @@ class schema_view {
     if (total > block.size()) return std::nullopt;
 
     if (!detail::is_valid_width(head.address_width)) return std::nullopt;
-    if (head.address_bits > 64) return std::nullopt;
+    if (head.address_bits > 64 && head.address_bits != no_key_mapping) return std::nullopt;
 
     // The directory widths gate every later bounds check, so they are validated
     // before anything is sized from them. A zero partition width is legal and
@@ -306,7 +315,15 @@ class schema_view {
     return std::nullopt;
   }
 
-  /// Split a key the way the image was built.
+  /// Whether this image defines a 64-bit key space at all. False when the
+  /// records were written from caller-split parts, in which case the key type
+  /// and its encoding are the caller's and the library cannot reproduce them.
+  [[nodiscard]] bool has_key_mapping() const noexcept {
+    return head_.address_bits != no_key_mapping;
+  }
+
+  /// Split a key the way the image was built. Meaningful only when
+  /// has_key_mapping(); callers on the other side of that hold parts already.
   [[nodiscard]] std::uint64_t partition_of(std::uint64_t key) const noexcept {
     return head_.address_bits >= 64 ? 0 : key >> head_.address_bits;
   }

@@ -577,8 +577,8 @@ void test_input_ordering() {
     const auto id = t.field("v").value();
     std::vector<std::uint64_t> seen;
     for (auto it = t.begin(); it != t.end(); ++it) {
-      seen.push_back(it.key());
-      CHECK(t.uint(it, id).value() == it.key() * 2);
+      seen.push_back(it.key().value());
+      CHECK(t.uint(it, id).value() == it.key().value() * 2);
     }
     CHECK((seen == std::vector<std::uint64_t>{10, 20, 30, 50}));
   }
@@ -941,6 +941,357 @@ void test_partition_remap_is_selective() {
   for (auto it = t.begin(); it != t.end(); ++it, ++want) {
     CHECK(it.key() == want->first);
     CHECK(t.uint(it, id).value() == want->second);
+  }
+}
+
+// --- arbitrary keys ---------------------------------------------------------
+
+/// A key too wide to pack into 64 bits, split into the two ordering coordinates
+/// the image is actually built from.
+struct ipv6 {
+  std::uint64_t high;
+  std::uint64_t low;
+  bool operator==(const ipv6&) const = default;
+  bool operator<(const ipv6& o) const {
+    return high != o.high ? high < o.high : low < o.low;
+  }
+};
+
+struct split_v6 {
+  std::pair<std::uint64_t, std::uint64_t> operator()(const ipv6& k) const {
+    return {k.high, k.low};
+  }
+};
+struct join_v6 {
+  ipv6 operator()(std::uint64_t p, std::uint64_t a) const { return ipv6{p, a}; }
+};
+
+void test_explicit_parts_wide_keys() {
+  // 128-bit keys, split 64/64. Neither half fits alongside the other, so there
+  // is no 64-bit key space at all -- which is the whole point of this mode.
+  std::mt19937_64 rng(90210);
+  std::map<ipv6, std::uint64_t> oracle;
+  for (std::uint64_t p = 0; p < 50; ++p) {
+    for (int i = 0; i < 20; ++i) {
+      const std::uint64_t high = (p << 48) | 0x2001'0db8'0000'0000ull;
+      const std::uint64_t low = rng();
+      oracle[ipv6{high, low}] = rng() % 1000;
+    }
+  }
+
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, {});
+  for (const auto& [k, v] : oracle) {  // std::map iterates in key order
+    auto rec = tb.begin_record_at(k.high, k.low);
+    rec.set_uint(f, v);
+    tb.commit(rec);
+  }
+  const auto report = tb.finish(sink);
+  CHECK(!report.has_key_mapping);
+  CHECK(tb.mode() == mmpack::key_mode::explicit_);
+
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  CHECK(!t.has_key_mapping());
+  CHECK(t.size() == oracle.size());
+  const auto id = t.field("v").value();
+
+  // Every record resolves through the pre-split entry points.
+  for (const auto& [k, v] : oracle) {
+    const auto it = t.find_at(k.high, k.low);
+    CHECK(it != t.end());
+    if (it == t.end()) continue;
+    CHECK(it.partition() == k.high);
+    CHECK(it.address() == k.low);
+    CHECK(t.uint(it, id).value() == v);
+    CHECK(!it.key().has_value());  // no 64-bit key exists for this image
+    CHECK(*it == (mmpack::key_parts{k.high, k.low}));
+  }
+
+  // Iteration is in (partition, address) order, which is the key order.
+  auto want = oracle.begin();
+  for (auto it = t.begin(); it != t.end(); ++it, ++want) {
+    CHECK(it.partition() == want->first.high);
+    CHECK(it.address() == want->first.low);
+  }
+
+  // floor_at against a std::map oracle, including probes between real keys.
+  for (int i = 0; i < 2000; ++i) {
+    const ipv6 probe{(rng() % 52) << 48 | 0x2001'0db8'0000'0000ull, rng()};
+    const auto got = t.floor_at(probe.high, probe.low);
+    const auto above = oracle.upper_bound(probe);
+    if (above == oracle.begin()) {
+      CHECK(got == t.end());
+    } else {
+      const auto expect = std::prev(above);
+      CHECK(got != t.end());
+      if (got != t.end()) {
+        CHECK(got.partition() == expect->first.high);
+        CHECK(got.address() == expect->first.low);
+      }
+    }
+  }
+
+  // The 64-bit key API finds nothing rather than searching a space that does
+  // not exist. has_key_mapping() is what tells those two apart.
+  CHECK(t.find(0) == t.end());
+  CHECK(t.lower_bound(0) == t.end());
+  CHECK(t.upper_bound(0) == t.end());
+  CHECK(t.floor(~std::uint64_t{0}) == t.end());
+  CHECK(t.ceil(0) == t.end());
+  CHECK(!t.contains(0));
+}
+
+void test_keyed_wrapper() {
+  std::vector<ipv6> keys;
+  for (std::uint64_t p = 1; p <= 30; ++p) {
+    for (std::uint64_t a = 0; a < 10; ++a) keys.push_back(ipv6{p * 1000, a * 7 + 1});
+  }
+
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, {});
+  mmpack::keyed_builder<ipv6, split_v6> kb(tb, split_v6{});
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    auto rec = kb.begin_record(keys[i]);
+    rec.set_uint(f, i);
+    kb.commit(rec);
+  }
+  tb.finish(sink);
+
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  const auto id = t.field("v").value();
+  const mmpack::keyed_table<ipv6, split_v6, join_v6> kt(t, split_v6{}, join_v6{});
+
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    const auto it = kt.find(keys[i]);
+    CHECK(it != kt.end());
+    if (it == kt.end()) continue;
+    CHECK(t.uint(it, id).value() == i);
+    CHECK(kt.key(it) == keys[i]);  // the join reconstructs the original key
+    CHECK(kt.contains(keys[i]));
+  }
+
+  // Bounds work through the wrapper too, on a key that is not stored.
+  const ipv6 gap{15 * 1000, 4};  // between 1 and 8
+  CHECK(kt.contains(gap) == false);
+  const auto fl = kt.floor(gap);
+  CHECK(fl != kt.end());
+  if (fl != kt.end()) CHECK(kt.key(fl) == (ipv6{15 * 1000, 1}));
+  const auto ce = kt.ceil(gap);
+  CHECK(ce != kt.end());
+  if (ce != kt.end()) CHECK(kt.key(ce) == (ipv6{15 * 1000, 8}));
+
+  // Past everything.
+  CHECK(kt.floor(ipv6{0, 0}) == kt.end());
+  CHECK(kt.ceil(ipv6{~std::uint64_t{0}, 0}) == kt.end());
+
+  // Without a join the wrapper still searches, but key() is not available --
+  // the same arrangement mmseek had, where join_key was optional and key() was
+  // gated on it.
+  const mmpack::keyed_table<ipv6, split_v6> plain(t, split_v6{});
+  CHECK(plain.find(keys[3]) != plain.end());
+  static_assert(mmpack::keyed_table<ipv6, split_v6, join_v6>::joinable);
+  static_assert(!mmpack::keyed_table<ipv6, split_v6>::joinable);
+  static_assert(requires(const mmpack::keyed_table<ipv6, split_v6, join_v6>& k,
+                         mmpack::table::const_iterator i) { k.key(i); });
+  // The negative direction is not asserted here: Apple Clang 14 reports the
+  // unsatisfied constraint as a hard error inside a requires-expression rather
+  // than as a substitution failure. The guarantee still holds -- calling key()
+  // without a join does not compile -- and `joinable` above records the intent.
+}
+
+void test_key_modes() {
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+
+  {  // mixing the two entry points in one build is refused
+    mmpack::table_builder tb(sb, {});
+    auto a = tb.begin_record(10);
+    a.set_uint(f, 1);
+    tb.commit(a);
+    CHECK_THROWS(tb.begin_record_at(1, 2), mmpack::build_error);
+  }
+  {  // and the other way round
+    mmpack::table_builder tb(sb, {});
+    auto a = tb.begin_record_at(1, 2);
+    a.set_uint(f, 1);
+    tb.commit(a);
+    CHECK_THROWS(tb.begin_record(10), mmpack::build_error);
+  }
+  {  // ordering is on (partition, address): a partition going backwards throws
+    mmpack::table_builder tb(sb, {});
+    auto a = tb.begin_record_at(5, 1);
+    a.set_uint(f, 1);
+    tb.commit(a);
+    auto b = tb.begin_record_at(4, 9);
+    b.set_uint(f, 2);
+    CHECK_THROWS(tb.commit(b), mmpack::build_error);
+  }
+  {  // as does an address going backwards inside one partition
+    mmpack::table_builder tb(sb, {});
+    auto a = tb.begin_record_at(5, 10);
+    a.set_uint(f, 1);
+    tb.commit(a);
+    auto b = tb.begin_record_at(5, 3);
+    b.set_uint(f, 2);
+    CHECK_THROWS(tb.commit(b), mmpack::build_error);
+  }
+  {  // and an exact duplicate
+    mmpack::table_builder tb(sb, {});
+    auto a = tb.begin_record_at(5, 10);
+    a.set_uint(f, 1);
+    tb.commit(a);
+    auto b = tb.begin_record_at(5, 10);
+    b.set_uint(f, 2);
+    CHECK_THROWS(tb.commit(b), mmpack::build_error);
+  }
+  {  // sort_if_needed recovers unordered caller-split input
+    mmpack::build_options o;
+    o.order = mmpack::input_order::sort_if_needed;
+    mmpack::table_builder tb(sb, o);
+    for (const auto& [p, a] : std::vector<std::pair<std::uint64_t, std::uint64_t>>{
+             {9, 1}, {2, 5}, {9, 0}, {2, 1}}) {
+      auto rec = tb.begin_record_at(p, a);
+      rec.set_uint(f, p * 100 + a);
+      tb.commit(rec);
+    }
+    mmpack::vector_sink sink;
+    const auto rep = tb.finish(sink);
+    CHECK(rep.sorted_during_finish);
+    const auto t = mmpack::table::open(sink.data(), sink.size());
+    const auto id = t.field("v").value();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> seen;
+    for (auto it = t.begin(); it != t.end(); ++it) {
+      seen.push_back({it.partition(), it.address()});
+      CHECK(t.uint(it, id).value() == it.partition() * 100 + it.address());
+    }
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> want{{2, 1}, {2, 5}, {9, 0}, {9, 1}};
+    CHECK(seen == want);
+  }
+  {  // an empty build has a key mapping: an empty table with a key space is the
+     // less surprising of the two
+    mmpack::table_builder tb(sb, {});
+    mmpack::vector_sink sink;
+    const auto rep = tb.finish(sink);
+    CHECK(rep.has_key_mapping);
+    const auto t = mmpack::table::open(sink.data(), sink.size());
+    CHECK(t.has_key_mapping());
+    CHECK(t.begin() == t.end());
+  }
+}
+
+void test_keyed_and_explicit_agree() {
+  // The same data through both entry points must produce the same image, which
+  // pins that the 64-bit key API really is only sugar over the parts.
+  const unsigned bits = 8;
+  const auto build_keyed = [&](mmpack::vector_sink& sink) {
+    mmpack::schema_builder sb;
+    const auto f = sb.add_uint("v");
+    mmpack::build_options o;
+    o.address_bits = bits;
+    mmpack::table_builder tb(sb, o);
+    for (std::uint64_t p = 0; p < 30; ++p) {
+      for (std::uint64_t a = 0; a < 9; ++a) {
+        auto rec = tb.begin_record((p << bits) | (a * 5));
+        rec.set_uint(f, p * 31 + a);
+        tb.commit(rec);
+      }
+    }
+    return tb.finish(sink);
+  };
+  const auto build_explicit = [&](mmpack::vector_sink& sink) {
+    mmpack::schema_builder sb;
+    const auto f = sb.add_uint("v");
+    mmpack::build_options o;
+    o.address_bits = bits;
+    mmpack::table_builder tb(sb, o);
+    for (std::uint64_t p = 0; p < 30; ++p) {
+      for (std::uint64_t a = 0; a < 9; ++a) {
+        auto rec = tb.begin_record_at(p, a * 5);
+        rec.set_uint(f, p * 31 + a);
+        tb.commit(rec);
+      }
+    }
+    return tb.finish(sink);
+  };
+
+  mmpack::vector_sink keyed, split;
+  const auto ka = build_keyed(keyed);
+  const auto kb = build_explicit(split);
+
+  // Identical but for the one byte that records whether a key space exists.
+  CHECK(keyed.size() == split.size());
+  CHECK(ka.has_key_mapping);
+  CHECK(!kb.has_key_mapping);
+  CHECK(ka.record_stride == kb.record_stride);
+  CHECK(ka.directory_stride == kb.directory_stride);
+
+  const auto ta = mmpack::table::open(keyed.data(), keyed.size());
+  const auto tb2 = mmpack::table::open(split.data(), split.size());
+  const auto fa = ta.field("v").value();
+  const auto fb = tb2.field("v").value();
+  CHECK(ta.size() == tb2.size());
+
+  auto ia = ta.begin();
+  auto ib = tb2.begin();
+  for (; ia != ta.end() && ib != tb2.end(); ++ia, ++ib) {
+    CHECK(ia.partition() == ib.partition());
+    CHECK(ia.address() == ib.address());
+    CHECK(ta.uint(ia, fa) == tb2.uint(ib, fb));
+    CHECK(ia.key().has_value());
+    CHECK(!ib.key().has_value());
+    CHECK(ia.key().value() == ((ia.partition() << bits) | ia.address()));
+  }
+  CHECK(ia == ta.end());
+  CHECK(ib == tb2.end());
+}
+
+void test_key_mapping_sentinel_rejected() {
+  // A shift is 0..64, so the sentinel must not be mistakable for one, and an
+  // out-of-range shift must still be refused.
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, {});
+  for (std::uint64_t i = 0; i < 20; ++i) {
+    auto rec = tb.begin_record(i);
+    rec.set_uint(f, i);
+    tb.commit(rec);
+  }
+  tb.finish(sink);
+  const auto image = sink.bytes();
+  mmpack::status s = mmpack::status::ok;
+
+  const auto patch_bits = [&](std::uint8_t bits) {
+    auto corrupt = image;
+    const auto foot =
+        mmpack::detail::load<mmpack::footer>(corrupt.data() + corrupt.size() - sizeof(mmpack::footer));
+    auto head = mmpack::detail::load<mmpack::schema_header>(corrupt.data() + foot.schema_offset);
+    head.address_bits = bits;
+    mmpack::detail::store(corrupt.data() + foot.schema_offset, head);
+    return corrupt;
+  };
+
+  {  // the sentinel is accepted, and turns the image into a no-key-space one
+    auto corrupt = patch_bits(mmpack::no_key_mapping);
+    const auto t = mmpack::table::open(corrupt.data(), corrupt.size());
+    CHECK(!t.has_key_mapping());
+    CHECK(t.find(3) == t.end());          // no key space to search
+    CHECK(t.find_at(0, 3) != t.end());    // the parts still work
+    CHECK(!t.begin().key().has_value());
+  }
+  {  // a shift beyond 64 that is not the sentinel is still rejected
+    auto corrupt = patch_bits(65);
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_schema);
+  }
+  {  // as is one just below the sentinel
+    auto corrupt = patch_bits(0xfe);
+    CHECK(!mmpack::table::try_open(corrupt.data(), corrupt.size(), &s).has_value());
+    CHECK(s == mmpack::status::bad_schema);
   }
 }
 
@@ -1346,6 +1697,11 @@ int main() {
   run("dedup give up", test_dedup_give_up);
   run("partition remap", test_partition_remap);
   run("partition remap is selective", test_partition_remap_is_selective);
+  run("explicit parts, wide keys", test_explicit_parts_wide_keys);
+  run("keyed wrapper", test_keyed_wrapper);
+  run("key modes", test_key_modes);
+  run("keyed and explicit agree", test_keyed_and_explicit_agree);
+  run("key mapping sentinel", test_key_mapping_sentinel_rejected);
   run("directory is narrowed", test_directory_is_narrowed);
   run("remap corruption", test_remap_corruption);
   run("rejects bad images", test_rejects_bad_images);

@@ -27,6 +27,7 @@
 #include "mmpack/dictionary.hpp"
 #include "mmpack/error.hpp"
 #include "mmpack/format.hpp"
+#include "mmpack/keyed.hpp"
 #include "mmpack/schema.hpp"
 #include "mmpack/sink.hpp"
 #include "mmpack/table.hpp"

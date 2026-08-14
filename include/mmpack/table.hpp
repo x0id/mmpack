@@ -27,20 +27,38 @@ namespace mmpack {
 ///
 /// Ordering follows std::map: elements are sorted by (partition, address), which
 /// is key order given the shift/mask split recorded in the schema.
+/// The two ordering coordinates of an element. These are what the image is
+/// actually built from and sorted by; a 64-bit key, where one exists at all, is
+/// just a packing of them.
+struct key_parts {
+  std::uint64_t partition = 0;
+  std::uint64_t address = 0;
+
+  [[nodiscard]] friend bool operator==(const key_parts&, const key_parts&) = default;
+};
+
 class table {
  public:
   class const_iterator {
    public:
     using iterator_category = std::bidirectional_iterator_tag;
-    using value_type = std::uint64_t;  // the key
+    using value_type = key_parts;
     using difference_type = std::ptrdiff_t;
 
     const_iterator() = default;
 
-    [[nodiscard]] std::uint64_t key() const { return owner_->key_at(slot_, index_); }
     [[nodiscard]] std::uint64_t partition() const { return owner_->slot_partition(slot_); }
     [[nodiscard]] std::uint64_t address() const { return owner_->address_at(slot_, index_); }
-    [[nodiscard]] std::uint64_t operator*() const { return key(); }
+    [[nodiscard]] key_parts operator*() const { return key_parts{partition(), address()}; }
+
+    /// The 64-bit key, when the image defines one. Empty for images built from
+    /// caller-split parts: the key type and its encoding are the caller's, and
+    /// the library has no way to reproduce them. Reconstruct those through your
+    /// own join -- see keyed_table in mmpack/keyed.hpp.
+    [[nodiscard]] std::optional<std::uint64_t> key() const {
+      if (!owner_->has_key_mapping()) return std::nullopt;
+      return owner_->key_at(slot_, index_);
+    }
 
     const_iterator& operator++() {
       ++index_;
@@ -238,6 +256,11 @@ class table {
   [[nodiscard]] bool interned() const noexcept { return interned_; }
   [[nodiscard]] const schema_view& schema() const noexcept { return schema_; }
 
+  /// Whether this image defines a 64-bit key space. False when it was built from
+  /// caller-split parts, in which case the key-taking lookups below have nothing
+  /// to search and the *_at forms are the interface.
+  [[nodiscard]] bool has_key_mapping() const noexcept { return schema_.has_key_mapping(); }
+
   [[nodiscard]] std::uint64_t partition_count() const noexcept {
     std::uint64_t n = 0;
     for (std::uint64_t i = 0; i < dir_count_; ++i) {
@@ -251,13 +274,20 @@ class table {
 
   // --- lookup ---------------------------------------------------------------
 
+  // The key-taking forms are sugar over the *_at ones for images that define a
+  // 64-bit key space. On an image built from caller-split parts there is no such
+  // space, so rather than search a key the caller never wrote, they find nothing;
+  // has_key_mapping() distinguishes that from a genuine miss.
   [[nodiscard]] const_iterator lower_bound(std::uint64_t key) const {
+    if (!has_key_mapping()) return end();
     return lower_bound_at(schema_.partition_of(key), schema_.address_of(key));
   }
   [[nodiscard]] const_iterator upper_bound(std::uint64_t key) const {
+    if (!has_key_mapping()) return end();
     return upper_bound_at(schema_.partition_of(key), schema_.address_of(key));
   }
   [[nodiscard]] const_iterator find(std::uint64_t key) const {
+    if (!has_key_mapping()) return end();
     return find_at(schema_.partition_of(key), schema_.address_of(key));
   }
   [[nodiscard]] bool contains(std::uint64_t key) const { return find(key) != end(); }
@@ -293,6 +323,7 @@ class table {
   /// decrement works but puts a begin() check on every caller, and the check is
   /// easy to forget or get subtly wrong.
   [[nodiscard]] const_iterator floor(std::uint64_t key) const {
+    if (!has_key_mapping()) return end();
     return floor_at(schema_.partition_of(key), schema_.address_of(key));
   }
 

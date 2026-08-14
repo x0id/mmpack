@@ -78,6 +78,9 @@ struct build_report {
   bool interned = false;
   bool dedup_abandoned = false;
   bool sorted_during_finish = false;
+  /// False when records were staged from caller-split parts, so the image
+  /// defines no 64-bit key space.
+  bool has_key_mapping = true;
   unsigned address_width = 0;
   unsigned ref_width = 0;
   std::uint32_t value_stride = 0;
@@ -93,23 +96,31 @@ struct build_report {
   std::uint64_t image_bytes = 0;
 };
 
-/// Where staged (key, tuple id) pairs live. An interface so a two-pass or
-/// spilling implementation can replace it without touching the builder.
+/// Where staged records live between consumption and layout. Records are staged
+/// as (partition, address) rather than as a packed key, because a caller-split
+/// key need not fit in 64 bits at all. An interface so a two-pass or spilling
+/// implementation can replace it without touching the builder.
 class record_staging {
  public:
   virtual ~record_staging() = default;
-  virtual void push(std::uint64_t key, std::uint64_t tuple_id) = 0;
+  virtual void push(std::uint64_t partition, std::uint64_t address, std::uint64_t tuple_id) = 0;
   virtual bool is_sorted() const noexcept = 0;
   virtual void sort() = 0;
   virtual std::uint64_t size() const noexcept = 0;
-  virtual std::uint64_t key_at(std::uint64_t i) const noexcept = 0;
+  virtual std::uint64_t partition_at(std::uint64_t i) const noexcept = 0;
+  virtual std::uint64_t address_at(std::uint64_t i) const noexcept = 0;
   virtual std::uint64_t tuple_at(std::uint64_t i) const noexcept = 0;
 };
 
-/// Straightforward in-memory staging: 16 bytes per record.
+/// Staging for images that do have a 64-bit key space: the two parts are packed
+/// back into one word and taken apart again on read. 16 bytes per record, which
+/// on a 290M-record build is 2.3 GB less than storing the parts separately.
 class memory_staging final : public record_staging {
  public:
-  void push(std::uint64_t key, std::uint64_t tuple_id) override {
+  explicit memory_staging(unsigned address_bits) noexcept : address_bits_(address_bits) {}
+
+  void push(std::uint64_t partition, std::uint64_t address, std::uint64_t tuple_id) override {
+    const std::uint64_t key = pack(partition, address);
     if (!rows_.empty() && key <= rows_.back().key) sorted_ = false;
     rows_.push_back(row{key, tuple_id});
   }
@@ -120,14 +131,68 @@ class memory_staging final : public record_staging {
     sorted_ = true;
   }
   [[nodiscard]] std::uint64_t size() const noexcept override { return rows_.size(); }
-  [[nodiscard]] std::uint64_t key_at(std::uint64_t i) const noexcept override { return rows_[i].key; }
+  [[nodiscard]] std::uint64_t partition_at(std::uint64_t i) const noexcept override {
+    return address_bits_ >= 64 ? 0 : rows_[i].key >> address_bits_;
+  }
+  [[nodiscard]] std::uint64_t address_at(std::uint64_t i) const noexcept override {
+    return address_bits_ >= 64 ? rows_[i].key
+                               : rows_[i].key & ((std::uint64_t{1} << address_bits_) - 1);
+  }
   [[nodiscard]] std::uint64_t tuple_at(std::uint64_t i) const noexcept override {
     return rows_[i].tuple;
   }
 
  private:
+  [[nodiscard]] std::uint64_t pack(std::uint64_t partition, std::uint64_t address) const noexcept {
+    return address_bits_ >= 64 ? address : (partition << address_bits_) | address;
+  }
+
   struct row {
     std::uint64_t key;
+    std::uint64_t tuple;
+  };
+  std::vector<row> rows_;
+  unsigned address_bits_;
+  bool sorted_ = true;
+};
+
+/// Staging for caller-split keys, where the parts need not share a 64-bit word.
+/// 24 bytes per record, paid only by builds that actually need keys that wide.
+class wide_staging final : public record_staging {
+ public:
+  void push(std::uint64_t partition, std::uint64_t address, std::uint64_t tuple_id) override {
+    if (!rows_.empty() && !before(rows_.back().partition, rows_.back().address, partition, address)) {
+      sorted_ = false;
+    }
+    rows_.push_back(row{partition, address, tuple_id});
+  }
+  [[nodiscard]] bool is_sorted() const noexcept override { return sorted_; }
+  void sort() override {
+    std::sort(rows_.begin(), rows_.end(), [](const row& a, const row& b) {
+      return before(a.partition, a.address, b.partition, b.address);
+    });
+    sorted_ = true;
+  }
+  [[nodiscard]] std::uint64_t size() const noexcept override { return rows_.size(); }
+  [[nodiscard]] std::uint64_t partition_at(std::uint64_t i) const noexcept override {
+    return rows_[i].partition;
+  }
+  [[nodiscard]] std::uint64_t address_at(std::uint64_t i) const noexcept override {
+    return rows_[i].address;
+  }
+  [[nodiscard]] std::uint64_t tuple_at(std::uint64_t i) const noexcept override {
+    return rows_[i].tuple;
+  }
+
+ private:
+  [[nodiscard]] static bool before(std::uint64_t pa, std::uint64_t aa, std::uint64_t pb,
+                                   std::uint64_t ab) noexcept {
+    return pa != pb ? pa < pb : aa < ab;
+  }
+
+  struct row {
+    std::uint64_t partition;
+    std::uint64_t address;
     std::uint64_t tuple;
   };
   std::vector<row> rows_;
@@ -137,6 +202,13 @@ class memory_staging final : public record_staging {
 class table_builder;
 
 /// Scratch handle for one record's field values. Fields left unset default to 0.
+/// Which key world a build is in, fixed by its first record.
+enum class key_mode {
+  undecided,
+  keyed,     ///< begin_record(uint64), split by options.address_bits
+  explicit_,  ///< begin_record_at(partition, address), split by the caller
+};
+
 class record_ref {
  public:
   void set_uint(field_id id, std::uint64_t v);
@@ -148,9 +220,11 @@ class record_ref {
 
  private:
   friend class table_builder;
-  explicit record_ref(table_builder* owner, std::uint64_t key) : owner_(owner), key_(key) {}
+  record_ref(table_builder* owner, std::uint64_t partition, std::uint64_t address)
+      : owner_(owner), partition_(partition), address_(address) {}
   table_builder* owner_;
-  std::uint64_t key_;
+  std::uint64_t partition_;
+  std::uint64_t address_;
 };
 
 class table_builder {
@@ -158,7 +232,6 @@ class table_builder {
   explicit table_builder(schema_builder schema, build_options options = {})
       : schema_(std::move(schema)),
         options_(options),
-        staging_(std::make_unique<memory_staging>()),
         slots_(schema_.size(), 0),
         stats_(schema_.size()),
         index_(0, tuple_hash{&tuples_, static_cast<std::uint32_t>(schema_.size())},
@@ -181,23 +254,45 @@ class table_builder {
 
   [[nodiscard]] const schema_builder& schema() const noexcept { return schema_; }
 
-  /// Begin a record. Field values are written through the returned handle and
-  /// the record is not staged until commit().
+  /// Begin a record keyed by a 64-bit value, split by options.address_bits.
+  /// Field values are written through the returned handle and the record is not
+  /// staged until commit().
   [[nodiscard]] record_ref begin_record(std::uint64_t key) {
+    enter_mode(key_mode::keyed);
     std::fill(slots_.begin(), slots_.end(), std::uint64_t{0});
-    return record_ref(this, key);
+    return record_ref(this, partition_of(key), address_of(key));
+  }
+
+  /// Begin a record from parts the caller has already split out. This is the
+  /// general entry point: the key itself can be any type and any width, because
+  /// the library only ever sees the two ordering coordinates. The image records
+  /// that it has no 64-bit key space, so nothing later pretends to rebuild one.
+  [[nodiscard]] record_ref begin_record_at(std::uint64_t partition, std::uint64_t address) {
+    enter_mode(key_mode::explicit_);
+    std::fill(slots_.begin(), slots_.end(), std::uint64_t{0});
+    return record_ref(this, partition, address);
   }
 
   void commit(const record_ref& rec) {
     if (finished_) throw build_error("commit() after finish()");
-    if (options_.order == input_order::assume_sorted && count_ != 0 && rec.key_ <= last_key_) {
-      throw build_error("keys must arrive strictly increasing: " + std::to_string(rec.key_) +
-                        " followed " + std::to_string(last_key_));
+    // Ordering is on (partition, address), which is what the image is sorted by.
+    // For keyed builds that is the same comparison as on the key itself.
+    if (options_.order == input_order::assume_sorted && count_ != 0 &&
+        !(last_partition_ < rec.partition_ ||
+          (last_partition_ == rec.partition_ && last_address_ < rec.address_))) {
+      throw build_error("keys must arrive strictly increasing: (" +
+                        std::to_string(rec.partition_) + ", " + std::to_string(rec.address_) +
+                        ") followed (" + std::to_string(last_partition_) + ", " +
+                        std::to_string(last_address_) + ")");
     }
-    staging_->push(rec.key_, intern_tuple());
-    last_key_ = rec.key_;
+    staging_->push(rec.partition_, rec.address_, intern_tuple());
+    last_partition_ = rec.partition_;
+    last_address_ = rec.address_;
     ++count_;
   }
+
+  /// Which key world this build is in. Undecided until the first record.
+  [[nodiscard]] key_mode mode() const noexcept { return mode_; }
 
   /// Measure, choose the shape, and write the image. Returns what it decided.
   template <byte_sink Sink>
@@ -205,10 +300,15 @@ class table_builder {
     if (finished_) throw build_error("finish() called twice");
     finished_ = true;
 
+    // An empty build never entered a mode; treat it as keyed, since an empty
+    // table with a key space is the less surprising of the two.
+    if (!staging_) staging_ = make_staging(key_mode::keyed);
+
     build_report report;
     report.records = count_;
     report.distinct_values = tuple_count();
     report.dedup_abandoned = !dedup_active_;
+    report.has_key_mapping = mode_ != key_mode::explicit_;
 
     if (!staging_->is_sorted()) {
       if (options_.order == input_order::assume_sorted) {
@@ -228,6 +328,28 @@ class table_builder {
   friend class record_ref;
 
   // --- staging ------------------------------------------------------------
+
+  /// Fix the key world on the first record, and pick the staging that fits it.
+  /// Keyed builds pack the parts back into one word; caller-split builds cannot,
+  /// so they carry both.
+  void enter_mode(key_mode wanted) {
+    if (finished_) throw build_error("records added after finish()");
+    if (mode_ == key_mode::undecided) {
+      mode_ = wanted;
+      if (!staging_) staging_ = make_staging(wanted);
+      return;
+    }
+    if (mode_ != wanted) {
+      throw build_error(
+          "a build is either keyed or caller-split, not both: begin_record() and "
+          "begin_record_at() cannot be mixed");
+    }
+  }
+
+  [[nodiscard]] std::unique_ptr<record_staging> make_staging(key_mode wanted) const {
+    if (wanted == key_mode::explicit_) return std::make_unique<wide_staging>();
+    return std::make_unique<memory_staging>(options_.address_bits);
+  }
 
   struct field_stats {
     std::uint64_t min = ~std::uint64_t{0};
@@ -293,8 +415,14 @@ class table_builder {
 
   void check_sorted_unique() const {
     for (std::uint64_t i = 1; i < staging_->size(); ++i) {
-      if (staging_->key_at(i) <= staging_->key_at(i - 1)) {
-        throw build_error("duplicate key after sorting: " + std::to_string(staging_->key_at(i)));
+      const bool increasing =
+          staging_->partition_at(i - 1) < staging_->partition_at(i) ||
+          (staging_->partition_at(i - 1) == staging_->partition_at(i) &&
+           staging_->address_at(i - 1) < staging_->address_at(i));
+      if (!increasing) {
+        throw build_error("duplicate key after sorting: (" +
+                          std::to_string(staging_->partition_at(i)) + ", " +
+                          std::to_string(staging_->address_at(i)) + ")");
       }
     }
   }
@@ -387,11 +515,11 @@ class table_builder {
       const std::uint64_t n = staging_->size();
       std::uint64_t i = 0;
       while (i < n) {
-        const std::uint64_t partition = partition_of(staging_->key_at(i));
+        const std::uint64_t partition = staging_->partition_at(i);
         local.clear();
         std::uint64_t j = i;
-        while (j < n && partition_of(staging_->key_at(j)) == partition) {
-          max_address = std::max(max_address, address_of(staging_->key_at(j)));
+        while (j < n && staging_->partition_at(j) == partition) {
+          max_address = std::max(max_address, staging_->address_at(j));
           local.insert(staging_->tuple_at(j));
           ++j;
         }
@@ -540,9 +668,9 @@ class table_builder {
     const std::uint64_t rows = staging_->size();
     std::uint64_t i = 0;
     while (i < rows) {
-      const std::uint64_t partition = partition_of(staging_->key_at(i));
+      const std::uint64_t partition = staging_->partition_at(i);
       std::uint64_t j = i;
-      while (j < rows && partition_of(staging_->key_at(j)) == partition) ++j;
+      while (j < rows && staging_->partition_at(j) == partition) ++j;
       const std::uint64_t count = j - i;
 
       std::uint32_t schema_id = remap::none;
@@ -580,7 +708,7 @@ class table_builder {
           interned_ ? address_width_ + width : address_width_ + value_stride_;
       for (std::uint64_t k = i; k < j; ++k) {
         std::memset(record.data(), 0, stride);
-        detail::store_uint(record.data(), address_width_, address_of(staging_->key_at(k)));
+        detail::store_uint(record.data(), address_width_, staging_->address_at(k));
         if (interned_) {
           const std::uint64_t global = staging_->tuple_at(k);
           const std::uint64_t ref = schema_id != remap::none ? to_local[global] : global;
@@ -671,7 +799,12 @@ class table_builder {
     head.value_stride = value_stride_;
     head.name_bytes = static_cast<std::uint32_t>(names.size());
     head.address_width = static_cast<std::uint8_t>(address_width_);
-    head.address_bits = static_cast<std::uint8_t>(options_.address_bits);
+    // A caller-split build has no 64-bit key space to describe, and guessing a
+    // shift from the observed addresses would produce keys that are ordered
+    // correctly but are not the caller's.
+    head.address_bits = mode_ == key_mode::explicit_
+                            ? no_key_mapping
+                            : static_cast<std::uint8_t>(options_.address_bits);
     head.mode = static_cast<std::uint8_t>(interned_ ? value_mode::interned
                                                     : value_mode::inline_fields);
     head.ref_width = static_cast<std::uint8_t>(interned_ ? ref_width_ : 0);
@@ -706,7 +839,9 @@ class table_builder {
   dir_layout dir_;  ///< settled once the directory's value ranges are known
 
   std::uint64_t count_ = 0;
-  std::uint64_t last_key_ = 0;
+  std::uint64_t last_partition_ = 0;
+  std::uint64_t last_address_ = 0;
+  key_mode mode_ = key_mode::undecided;
   std::uint32_t value_stride_ = 0;
   std::uint32_t record_stride_ = 0;
   unsigned address_width_ = 1;

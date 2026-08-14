@@ -265,10 +265,10 @@ int main() {
       continue;
     }
     std::printf("  lower_bound(%-15s) -> %-15s via %-9s asn %-6llu %s\n",
-                format_ip(probe).c_str(), format_ip(it.key()).c_str(),
+                format_ip(probe).c_str(), format_ip(it.key().value()).c_str(),
                 std::string(interned_table.text(it, ids.interface).value_or("?")).c_str(),
                 static_cast<unsigned long long>(interned_table.uint(it, ids.asn).value_or(0)),
-                it.key() == probe ? "(exact)" : "(next above)");
+                it.key().value() == probe ? "(exact)" : "(next above)");
   }
 
   // --- space and speed ------------------------------------------------------
