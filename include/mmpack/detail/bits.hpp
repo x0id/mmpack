@@ -63,6 +63,19 @@ inline void store_uint(std::byte* p, unsigned width, std::uint64_t v) noexcept {
   }
 }
 
+/// Exact bytes needed to hold `max_value`, 1..8 -- 3, 5, 6 and 7 included.
+///
+/// width_for below snaps to 1/2/4/8 because the values it sizes are read back
+/// through load_uint's switch, where the odd widths fall into a memcpy with a
+/// runtime length. This one is for the address alone, which is read through a
+/// masked 8-byte load instead, so every width costs exactly the same and there
+/// is no reason to round up.
+[[nodiscard]] constexpr unsigned exact_width_for(std::uint64_t max_value) noexcept {
+  unsigned w = 1;
+  while (w < 8 && (max_value >> (8 * w)) != 0) ++w;
+  return w;
+}
+
 /// Narrowest of 1, 2, 4, 8 that can hold `range` distinct values 0..range-1.
 [[nodiscard]] constexpr unsigned width_for(std::uint64_t max_value) noexcept {
   if (max_value <= 0xffull) return 1;

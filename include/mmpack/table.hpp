@@ -49,10 +49,22 @@ class table {
       return owner_->address_at(slot_, index_);
     }
 
-    /// The address exactly as stored, whatever its width. Always valid, and for
-    /// a wide image this is the only faithful view of it.
+    /// The bytes this element's partition actually stores -- the significant
+    /// stretch of the address, which may be narrower than table::address_width()
+    /// because the partition trimmed zero bytes off either end. They belong at
+    /// offset address_skip() within the full field; everything else there is
+    /// zero. Use address_into() to get the whole field back in one step.
     [[nodiscard]] std::span<const std::byte> address_bytes() const {
       return owner_->address_bytes_at(slot_, index_);
+    }
+
+    /// Where address_bytes() sits within the full address field.
+    [[nodiscard]] unsigned address_skip() const { return owner_->address_skip_at(slot_); }
+
+    /// Rebuild the full address field, zero-filling whatever was trimmed. `out`
+    /// must be exactly table::address_width() bytes; returns false otherwise.
+    [[nodiscard]] bool address_into(std::span<std::byte> out) const {
+      return owner_->address_into_at(slot_, index_, out);
     }
 
     /// The 64-bit key, when the image defines one. Empty for images built from
@@ -158,6 +170,11 @@ class table {
     t.record_stride_ = schema->record_stride();
     t.address_width_ = schema->address_width();
     t.ref_width_ = schema->ref_width();
+    // What follows the address in a record. Held separately because the address
+    // part now varies per partition while this does not, so a partition's stride
+    // is its own address width plus this.
+    if (t.record_stride_ < t.address_width_) return fail(status::bad_schema);
+    t.value_part_ = t.record_stride_ - t.address_width_;
 
     // --- directory ---
     t.dir_ = schema->directory_layout();
@@ -189,18 +206,30 @@ class table {
       // partition at all, so slot i describes partition i by construction.
       if (i > 0 && d.partition <= previous) return fail(status::bad_directory);
 
+      // The stretch of the address field this partition stores must lie inside
+      // that field. Written as a subtraction against the width already shown to
+      // be the smaller, so the sum cannot overflow.
+      if (d.address_width > t.address_width_ ||
+          d.address_skip > t.address_width_ - d.address_width) {
+        return fail(status::bad_directory);
+      }
+
       // A remapped partition carries its own reference width and lookup table,
       // so its geometry has to be validated before it can be trusted to size
       // the record block.
-      std::uint64_t stride = t.record_stride_;
+      std::uint64_t stride = d.address_width + t.value_part_;
       if (d.schema_id != remap::none) {
         if (d.schema_id > remap::max_local_width) return fail(status::bad_directory);
         if (!t.interned_) return fail(status::bad_directory);  // nothing to remap into
         if (d.remap_count == 0 || d.count == 0) return fail(status::bad_directory);
-        stride = t.address_width_ + d.schema_id;
+        stride = d.address_width + d.schema_id;
       } else if (d.remap_count != 0) {
         return fail(status::bad_directory);
       }
+      // A zero stride would make every record start at the same byte, and the
+      // record-count check below divide by zero. Reachable only from a corrupt
+      // image: an address trimmed to nothing alongside an empty value tuple.
+      if (stride == 0) return fail(status::bad_directory);
 
       if (d.count != 0) {
         if (d.offset < floor || d.offset > foot.dir_offset) return fail(status::bad_directory);
@@ -272,7 +301,11 @@ class table {
   /// Whether addresses fit an integer. When false they are opaque byte strings
   /// compared lexicographically, and the span-taking *_at forms are the way in.
   [[nodiscard]] bool narrow_address() const noexcept { return schema_.narrow_address(); }
+  /// The full address field, which every query is given at. What an individual
+  /// record stores may be narrower -- see iterator::address_bytes().
   [[nodiscard]] unsigned address_width() const noexcept { return address_width_; }
+  /// Whether any partition stores less than the full field.
+  [[nodiscard]] bool trims_addresses() const noexcept { return schema_.trims_addresses(); }
 
   [[nodiscard]] std::uint64_t partition_count() const noexcept {
     std::uint64_t n = 0;
@@ -462,7 +495,17 @@ class table {
     std::uint64_t index = 0;
     if (slot < dir_count_ && slot_partition(slot) == partition) {
       const partition_layout p = layout_of(slot);
-      index = Narrow ? search_lower_narrow(p, value) : search_lower_wide(p, bytes);
+      // One call, not a choice between two: instantiating both loop bodies here
+      // measured ~3% on the narrow path, the same code-size effect that made
+      // templating the regime expensive in e9a2744. `tail` is folded into the
+      // operand instead -- see narrow_probe and search_wide.
+      if constexpr (Narrow) {
+        const narrow_probe q = probe_narrow(p, value);
+        index = search_lower_narrow(p, q.value + (q.tail ? 1 : 0));
+      } else {
+        const wide_probe q = probe_wide(p, bytes);
+        index = q.head ? p.count : search_wide(p, q.bytes, q.tail ? 1 : 0);
+      }
     }
     normalize(slot, index);
     return const_iterator(this, slot, index);
@@ -475,7 +518,7 @@ class table {
     std::uint64_t index = 0;
     if (slot < dir_count_ && slot_partition(slot) == partition) {
       const partition_layout p = layout_of(slot);
-      index = Narrow ? search_upper_narrow(p, value) : search_upper_wide(p, bytes);
+      index = search_above<Narrow>(p, value, bytes);
     }
     normalize(slot, index);
     return const_iterator(this, slot, index);
@@ -490,8 +533,7 @@ class table {
     if (slot_partition(slot) == partition) {
       const partition_layout p = layout_of(slot);
       if (p.count != 0) {
-        const std::uint64_t above =
-            Narrow ? search_upper_narrow(p, value) : search_upper_wide(p, bytes);
+        const std::uint64_t above = search_above<Narrow>(p, value, bytes);
         if (above != 0) return const_iterator(this, slot, above - 1);
       }
       // The partition exists but holds nothing at or below the target, so the
@@ -510,13 +552,25 @@ class table {
     if (slot >= dir_count_) return end();
     const partition_layout p = layout_of(slot);
     if (p.count == 0) return end();
-    const std::uint64_t index = Narrow ? search_lower_narrow(p, value)
-                                       : search_lower_wide(p, bytes);
-    if (index >= p.count) return end();
-    const std::byte* rec = p.records + index * p.stride;
-    const bool equal = Narrow ? detail::load_uint(rec, address_width_) == value
-                              : std::memcmp(rec, bytes, address_width_) == 0;
-    if (!equal) return end();
+
+    // Anything the query carries outside this partition's stored range cannot be
+    // matched by a record, whose bytes there are zero by construction.
+    std::uint64_t index = 0;
+    if constexpr (Narrow) {
+      const narrow_probe q = probe_narrow(p, value);
+      if (q.tail) return end();
+      index = search_lower_narrow(p, q.value);
+      if (index >= p.count) return end();
+      if (load_address(p.records + index * p.stride, p.address_width) != q.value) {
+        return end();
+      }
+    } else {
+      const wide_probe q = probe_wide(p, bytes);
+      if (q.head || q.tail) return end();
+      index = search_wide(p, q.bytes, 0);
+      if (index >= p.count) return end();
+      if (std::memcmp(p.records + index * p.stride, q.bytes, p.address_width) != 0) return end();
+    }
     return const_iterator(this, slot, index);
   }
 
@@ -524,7 +578,7 @@ class table {
     return directory_ + i * dir_.stride;
   }
   [[nodiscard]] dir_entry slot(std::uint64_t i) const {
-    return decode_dir_entry(slot_bytes(i), dir_, i);
+    return decode_dir_entry(slot_bytes(i), dir_, i, address_width_);
   }
   // Directory fields are read as one wide load plus a mask rather than a switch
   // on the width. The 8-byte read is proven in bounds at open(): the directory
@@ -553,6 +607,11 @@ class table {
     std::uint32_t remap_count = 0;
     unsigned stride = 0;
     unsigned ref_width = 0;  ///< local width when remapped, else the global one
+    /// The stretch of the address field this partition stores: bytes
+    /// [address_skip, address_skip + address_width) of a field address_width()
+    /// bytes wide. Everything outside it is zero in every record here.
+    unsigned address_width = 0;
+    unsigned address_skip = 0;
     bool remapped = false;
   };
 
@@ -573,8 +632,18 @@ class table {
             ? static_cast<std::uint32_t>(
                   detail::load_uint_masked(p + dir_.remap_at, dir_.remap_mask))
             : 0;
+    // Absent fields mean no partition trims anything, so the full field is the
+    // answer and images without trimming cost nothing to read.
+    out.address_width =
+        dir_.addr_width != 0
+            ? static_cast<unsigned>(detail::load_uint_masked(p + dir_.addr_at, dir_.addr_mask))
+            : address_width_;
+    out.address_skip =
+        dir_.skip_width != 0
+            ? static_cast<unsigned>(detail::load_uint_masked(p + dir_.skip_at, dir_.skip_mask))
+            : 0;
     out.ref_width = out.remapped ? schema_id : ref_width_;
-    out.stride = out.remapped ? address_width_ + schema_id : record_stride_;
+    out.stride = out.address_width + (out.remapped ? schema_id : value_part_);
     out.remap = out.remapped ? base_ + offset : nullptr;
     out.records =
         base_ + offset +
@@ -582,18 +651,57 @@ class table {
     return out;
   }
 
+  /// First index strictly above the target. `rec <= query` reduces to the same
+  /// comparison whether or not the query has anything below the partition's
+  /// stored range, so unlike lower_bound this never consults `tail`.
+  template <bool Narrow>
+  [[nodiscard]] std::uint64_t search_above(const partition_layout& p, std::uint64_t value,
+                                           const std::byte* bytes) const {
+    if constexpr (Narrow) {
+      return search_upper_narrow(p, probe_narrow(p, value).value);
+    } else {
+      const wide_probe q = probe_wide(p, bytes);
+      return q.head ? p.count : search_wide(p, q.bytes, 1);
+    }
+  }
+
   [[nodiscard]] const std::byte* record(std::uint64_t s, std::uint64_t i) const {
     const partition_layout p = layout_of(s);
     return p.records + i * p.stride;
   }
+  /// The address as an integer. The stored bytes are the field's low `width`
+  /// bytes starting `skip` in, so shifting them back up reproduces the value
+  /// exactly -- the trimmed bytes were zero in every record here.
+  ///
+  /// The masked 8-byte load is in bounds for the same reason the directory's is:
+  /// open() proves the records end at or before dir_offset and that dir_offset
+  /// itself has eight readable bytes after it, so eight bytes from any record
+  /// start still land inside the image.
   [[nodiscard]] std::uint64_t address_at(std::uint64_t s, std::uint64_t i) const {
     const partition_layout p = layout_of(s);
-    return detail::load_uint(p.records + i * p.stride, address_width_);
+    const std::uint64_t stored =
+        load_address(p.records + i * p.stride, p.address_width);
+    return p.address_skip >= 8 ? 0 : stored << (8 * p.address_skip);
   }
+  /// Only the bytes actually stored. Use address_skip_at() to place them, or
+  /// address_into() to get the whole field back.
   [[nodiscard]] std::span<const std::byte> address_bytes_at(std::uint64_t s,
                                                             std::uint64_t i) const {
     const partition_layout p = layout_of(s);
-    return {p.records + i * p.stride, address_width_};
+    return {p.records + i * p.stride, p.address_width};
+  }
+  [[nodiscard]] unsigned address_skip_at(std::uint64_t s) const {
+    return layout_of(s).address_skip;
+  }
+  /// Rebuild the full address field, zero-filling what this partition trimmed.
+  /// `out` must be exactly address_width() bytes.
+  [[nodiscard]] bool address_into_at(std::uint64_t s, std::uint64_t i,
+                                     std::span<std::byte> out) const {
+    if (out.size() != address_width_) return false;
+    const partition_layout p = layout_of(s);
+    std::memset(out.data(), 0, out.size());  // skip + width <= address_width_, proven at open
+    std::memcpy(out.data() + p.address_skip, p.records + i * p.stride, p.address_width);
+    return true;
   }
   [[nodiscard]] std::uint64_t key_at(std::uint64_t s, std::uint64_t i) const {
     const std::uint64_t bits = schema_.address_bits();
@@ -608,9 +716,9 @@ class table {
     if (it.slot_ >= dir_count_) return nullptr;
     const partition_layout p = layout_of(it.slot_);
     const std::byte* r = p.records + it.index_ * p.stride;
-    if (!interned_) return r + address_width_;
+    if (!interned_) return r + p.address_width;
 
-    std::uint64_t ref = detail::load_uint(r + address_width_, p.ref_width);
+    std::uint64_t ref = detail::load_uint(r + p.address_width, p.ref_width);
     if (p.remapped) {
       // The local index only means anything through this partition's table, and
       // a corrupt one would otherwise read straight into the records that
@@ -723,6 +831,96 @@ class table {
     return floor_at_or_before(s - 1);
   }
 
+  // A query is given at the full address width; a partition stores only part of
+  // it. These reduce the query to that part once per lookup, and record what was
+  // left over on each side.
+  //
+  //   tail -- the query has something *below* the stored range, so it sorts
+  //           strictly after any record matching on the range itself
+  //   head -- the query has something *above* it, so it sorts after every record
+  //           in the partition outright
+  //
+  // Both are settled before the search and never consulted inside it. With tail
+  // set, "rec < query" becomes "rec <= query on the stored range", which each
+  // regime folds into its operand rather than into a second loop: the narrow
+  // side searches for value + 1, the wide side raises search_wide's limit.
+  // See search_above for why upper_bound needs neither.
+  struct narrow_probe {
+    std::uint64_t value = 0;  ///< the query, shifted down to the stored range
+    bool tail = false;
+  };
+  struct wide_probe {
+    const std::byte* bytes = nullptr;  ///< the query, advanced to the stored range
+    bool tail = false;
+    bool head = false;
+  };
+
+  /// No `head` here: the stored value is an integer bounded by the stored width,
+  /// so a query above everything representable simply loses every comparison and
+  /// the loop returns count on its own.
+  ///
+  /// `value + 1` is what lower_bound searches for when `tail` is set, and it
+  /// cannot overflow: tail can only be true when the shift is nonzero, which
+  /// already bounds value below 2^(64-shift).
+  [[nodiscard]] static narrow_probe probe_narrow(const partition_layout& p,
+                                                 std::uint64_t address) noexcept {
+    narrow_probe out;
+    const unsigned s = 8 * p.address_skip;
+    out.value = s >= 64 ? 0 : address >> s;
+    out.tail = s >= 64 ? address != 0 : (address & ((std::uint64_t{1} << s) - 1)) != 0;
+    return out;
+  }
+
+  [[nodiscard]] wide_probe probe_wide(const partition_layout& p,
+                                      const std::byte* address) const noexcept {
+    wide_probe out;
+    out.bytes = address + p.address_skip;
+    for (unsigned i = 0; i < p.address_skip; ++i) {
+      if (address[i] != std::byte{0}) {
+        out.head = true;
+        break;
+      }
+    }
+    for (unsigned i = p.address_skip + p.address_width; i < address_width_; ++i) {
+      if (address[i] != std::byte{0}) {
+        out.tail = true;
+        break;
+      }
+    }
+    return out;
+  }
+
+  /// Load a stored address of runtime width.
+  ///
+  /// The natural sizes are read at their natural size and only the odd widths
+  /// fall back to an 8-byte load and a mask -- not load_uint's memcpy, which
+  /// with a runtime length is a call per probe.
+  ///
+  /// Reading *only* `width` bytes is what matters here, and it is worth more
+  /// than removing the switch. Masking a uniform 8-byte load looked free, and is
+  /// on the directory, which stays in cache; on records it measured 8-11% slower
+  /// on a stride-6 image, because eight bytes from every record start straddle a
+  /// cache line roughly seven times as often as two bytes do, and these records
+  /// come from DRAM. The switch itself costs nothing: the width is loop-invariant
+  /// and the branch predicts perfectly.
+  ///
+  /// The 8-byte read in the fallback is in bounds because open() proves records
+  /// end at or before dir_offset and that dir_offset has eight readable bytes
+  /// after it, so eight bytes from any record start still land inside the image.
+  /// The mask is derived here rather than carried on partition_layout: only the
+  /// fallback wants it, and keeping it in the struct made it live across the
+  /// search loop for nothing.
+  [[nodiscard]] static std::uint64_t load_address(const std::byte* p, unsigned width) noexcept {
+    switch (width) {
+      case 1: return detail::load<std::uint8_t>(p);
+      case 2: return detail::load<std::uint16_t>(p);
+      case 4: return detail::load<std::uint32_t>(p);
+      case 8: return detail::load<std::uint64_t>(p);
+      default:  // 0, 3, 5, 6, 7
+        return detail::load_uint_masked(p, detail::mask_for_width(width));
+    }
+  }
+
   // The comparison regime is a property of the image, not of a probe, so it is
   // resolved once per lookup and never inside the loop. The narrow bodies are
   // kept as their own plain functions rather than an instantiation of a shared
@@ -735,7 +933,7 @@ class table {
     while (len > 0) {
       const std::uint64_t half = len / 2;
       const std::uint64_t mid = lo + half;
-      if (detail::load_uint(p.records + mid * p.stride, address_width_) < address) {
+      if (load_address(p.records + mid * p.stride, p.address_width) < address) {
         lo = mid + 1;
         len -= half + 1;
       } else {
@@ -747,14 +945,20 @@ class table {
 
   /// Lexicographic on the raw bytes, which is why a wide address has to be given
   /// in an order-preserving encoding.
-  [[nodiscard]] std::uint64_t search_lower_wide(const partition_layout& p,
-                                                const std::byte* address) const {
+  ///
+  /// `limit` selects the bound, which is why there is only one wide loop: a
+  /// memcmp result is compared `< 0` for lower_bound and `< 1` -- that is,
+  /// `<= 0` -- for upper_bound, and a query carrying something below the stored
+  /// range needs the second even when asked for the first. It is loop-invariant,
+  /// so this costs a register rather than an instantiation.
+  [[nodiscard]] std::uint64_t search_wide(const partition_layout& p, const std::byte* address,
+                                          int limit) const {
     std::uint64_t lo = 0;
     std::uint64_t len = p.count;
     while (len > 0) {
       const std::uint64_t half = len / 2;
       const std::uint64_t mid = lo + half;
-      if (std::memcmp(p.records + mid * p.stride, address, address_width_) < 0) {
+      if (std::memcmp(p.records + mid * p.stride, address, p.address_width) < limit) {
         lo = mid + 1;
         len -= half + 1;
       } else {
@@ -778,24 +982,7 @@ class table {
     while (len > 0) {
       const std::uint64_t half = len / 2;
       const std::uint64_t mid = lo + half;
-      if (!(address < detail::load_uint(p.records + mid * p.stride, address_width_))) {
-        lo = mid + 1;
-        len -= half + 1;
-      } else {
-        len = half;
-      }
-    }
-    return lo;
-  }
-
-  [[nodiscard]] std::uint64_t search_upper_wide(const partition_layout& p,
-                                                const std::byte* address) const {
-    std::uint64_t lo = 0;
-    std::uint64_t len = p.count;
-    while (len > 0) {
-      const std::uint64_t half = len / 2;
-      const std::uint64_t mid = lo + half;
-      if (std::memcmp(p.records + mid * p.stride, address, address_width_) <= 0) {
+      if (!(address < load_address(p.records + mid * p.stride, p.address_width))) {
         lo = mid + 1;
         len -= half + 1;
       } else {
@@ -816,6 +1003,7 @@ class table {
   std::vector<blob_dictionary_view> blob_dicts_;
   fixed_dictionary_view value_dict_;
   std::uint32_t record_stride_ = 0;
+  std::uint32_t value_part_ = 0;  ///< record_stride_ - address_width_
   unsigned address_width_ = 1;
   unsigned ref_width_ = 1;
   bool dense_ = false;

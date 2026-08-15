@@ -61,8 +61,8 @@ derived record shape (value tuple = 7 bytes):
 
 layout            bytes   stride     /entry     ns/query
 naive          23970000       48       48.0            -
-inline          4625941        9        9.3         45.3
-interned        2150101        4        4.3         41.0
+inline          4519453        9        9.1         43.7
+interned        2043613        4        4.1         41.8
 ```
 
 `naive` is what a fixed-width struct with inline 16-byte strings would cost. The
@@ -102,6 +102,63 @@ mixes both — the reader takes the stride from the directory entry. Turn it off
 with `build_options.partition_remap = false`. `build_report` reports
 `remapped_partitions` and `remap_saved_bytes`, and the saving is folded into the
 interning cost model so the two decisions stay consistent.
+
+### Per-partition address trimming
+
+The address field is as wide as the widest address anywhere in the table, so
+every record pays for the deepest one. Region-start tables barely use it: an
+IPv6 `/64` start leaves the bottom two thirds of the field zero, and a `/24`
+IPv4 start leaves the bottom byte zero.
+
+So each partition stores only the stretch of the field it actually uses:
+
+> **OR every address in the partition together. Store the bytes from the first
+> nonzero byte of the OR to the last.**
+
+Everything trimmed is zero in every record there, so zero-extension recovers each
+address exactly and is monotone — the sort order is untouched. The rule is about
+byte positions, which is what lets it hold for both regimes at once. Which end
+pays off is what differs, and both ends are worth having:
+
+| | leading memory zeros | trailing memory zeros |
+|---|---|---|
+| narrow (≤ 8 bytes), little-endian | low-order — region-start granularity | high-order — small magnitude |
+| wide (> 8 bytes), big-endian | high-order — small magnitude | low-order — region-start granularity |
+
+```
+IPv4 10.0.0.0 in a 4-byte LE field:   00 00 00 | 0A        skip=3, width=1
+2001:0db8:: in a 12-byte BE field:    20 01 0d b8 | 00 ...  skip=0, width=4
+```
+
+Measured on two real IPv6 geo-IP images, 189,384,074 records each:
+
+| partition | baseline | trimmed | image |
+|---|---:|---:|---:|
+| `/24` | 13 B/record | 7.28 B/record | 3265.9 → 2232.1 MiB (−31.7%) |
+| `/32` | 12 B/record | **4.88 B/record** | 3008.9 → **1722.7 MiB (−42.7%)** |
+
+The distribution is what makes this work: at `/32`, 88.85% of records need 4
+bytes and 11.03% need 12, with 0.12% in between. Those are two populations —
+network allocations and host entries — and they are spatially separated, so a
+per-partition maximum cuts along the seam instead of averaging across it.
+
+Partition granularity and trimming are coupled, which is worth knowing before
+choosing one. The same records go from 28.06% deep at `/24` to 11.03% at `/32`
+purely by partitioning finer: a coarse partition lumps many prefixes together, so
+one deep entry taxes all of them. Finer partitions isolate outliers *and* shrink
+the baseline field.
+
+A query is always given at the full width; the partition's stored range is
+resolved from the directory and the query reduced to it once per lookup, never
+per probe. Turn it off with `build_options.partition_address_width = false`.
+`build_report` reports `address_bytes_total`, `address_saved_bytes` and
+`narrowed_partitions`. Both directory fields are omitted entirely when no
+partition trims anything, so an image with nothing to gain is byte-for-byte what
+it was before the feature existed.
+
+**It costs build time**: the OR pass touches every address byte, ~2.3 G byte
+operations at 189M × 12. It is one sequential pass folded into a walk the builder
+already makes, but it is not free.
 
 ## The interning cost model
 
@@ -216,11 +273,23 @@ and IPv6 network order already is one, so it works unchanged. This is the same
 contract a split already carries.
 
 The width is fixed by the first such record and every later one must match; a
-uniform stride is what makes the binary search possible. `narrow_address()` says
-which regime an image is in, `iterator::address()` returns `std::nullopt` on a
-wide one, and `iterator::address_bytes()` is always valid. Each `*_at` form takes
-either an integer or a span: the span form serves both regimes, and the integer
-form finds nothing on a wide image, since the probe is not in its address space.
+uniform field is what makes the binary search possible. `narrow_address()` says
+which regime an image is in, and `iterator::address()` returns `std::nullopt` on
+a wide one. Each `*_at` form takes either an integer or a span: the span form
+serves both regimes, and the integer form finds nothing on a wide image, since
+the probe is not in its address space.
+
+Reading an address back has two forms, because a partition may store only part of
+the field (see per-partition address trimming above):
+
+```cpp
+it.address_bytes()   // just the stored bytes, at it.address_skip()
+it.address_into(out) // the whole field, zero-filling what was trimmed
+```
+
+`address_into` takes exactly `table::address_width()` bytes and is what you want
+unless you are deliberately working with the packed form. `keyed_table::key()`
+uses it, so a join always sees the key that was written.
 
 Widths 3, 5, 6 and 7 are legal too — they were only ever excluded by a check that
 listed 1, 2, 4 and 8.
@@ -354,11 +423,13 @@ or one reference into the composite dictionary:
 - inline: `base = record + address_width`
 - interned: `base = value_dict + load(record + address_width, ref_width) * value_stride`
 
-Record stride is fixed *within* a partition but may differ *between* them: a
-remapped partition prefixes its records with a table of global tuple ids and
-narrows its references accordingly. `dir_entry::schema_id` carries the local
-reference width (0 = global) and `remap_count` the table length, so the reader
-resolves the geometry before the search starts.
+Record stride is fixed *within* a partition but may differ *between* them, on
+both sides of the record. A remapped partition prefixes its records with a table
+of global tuple ids and narrows its references accordingly; a trimmed partition
+narrows the address. `dir_entry::schema_id` carries the local reference width
+(0 = global), `remap_count` the table length, and `address_width`/`address_skip`
+the stored stretch of the address — so the reader resolves the whole geometry in
+one directory read before the search starts.
 
 **The directory itself is packed the same way the records are.** `dir_entry` is
 the decoded form, not the stored one: each field is narrowed to what the image
@@ -369,11 +440,19 @@ against the 32 a struct would take, so seven slots share a cache line instead of
 two. The widths live in the schema block, which the reader parses before it
 touches the directory.
 
-Fields are read as one masked 8-byte load rather than a switch on the width,
-which is what keeps the packed form from costing more than it saves; `open()`
-proves the eight bytes are in range. Measured against the fixed-struct
+Directory fields are read as one masked 8-byte load rather than a switch on the
+width, which is what keeps the packed form from costing more than it saves;
+`open()` proves the eight bytes are in range. Measured against the fixed-struct
 directory on 4.8M records: 32.07 → 30.99 MB and 84.0 → 82.8 ns without remap,
 22.39 → 21.39 MB and 67.7 → 63.8 ns with it.
+
+**That trick does not transfer to records**, which is worth stating because it
+looks like it should. Reading addresses the same way measured 8–11% slower on a
+stride-6 image: eight bytes from every record start straddle a cache line roughly
+seven times as often as two bytes do, and unlike the directory these lines come
+from DRAM. Addresses are read at their natural size for widths 1, 2, 4 and 8,
+with the masked load kept only as the fallback for 0, 3, 5, 6 and 7. The width
+switch costs nothing — it is loop-invariant and predicts perfectly.
 
 Lookup is two steps as ever: select the partition (O(1) when partition indices
 are dense, O(log P) when sparse), then binary search the fixed-stride records.
@@ -382,6 +461,11 @@ Key splitting is runtime configuration — `partition = key >> address_bits` —
 
 `length` must be the **exact** image size. The footer is found by counting back
 from the end, so a region with trailing slack is rejected rather than misread.
+
+The format is at **version 4**, and there is no read path for older images —
+per-partition address trimming added two fields to the schema header, which moves
+everything after it. Images built by an earlier version are rejected on the
+version check rather than misparsed, and have to be rebuilt.
 
 ### Untrusted images
 
@@ -425,8 +509,12 @@ Requires C++20. Tested with Apple Clang 14 on arm64.
   checks; a wrong `uint` vs `text` call is a `nullopt`, not a build error.
 - **Runtime stride and field offsets** cost some lookup throughput against a
   compile-time layout. That is the trade this project exists to make.
-- **One value-tuple layout per image.** Field widths and offsets are global;
-  only the *reference* width varies per partition (see per-partition remap).
-  Per-partition field widths would be a larger change for, on these workloads,
-  a much smaller return.
+- **One value-tuple layout per image.** Field widths and offsets are global. What
+  varies per partition is the *reference* width (per-partition remap) and the
+  *address* range (per-partition trimming) — the two ends of a record, not the
+  tuple in between. Per-partition field widths would be a larger change for, on
+  these workloads, a much smaller return.
+- **Trimming removes zero bytes only.** A partition whose addresses share a
+  nonzero prefix still stores it in every record; eliding that would mean
+  carrying the prefix in the directory, which is a different change.
 - **Iterators borrow the table**, which borrows the mapping. Keep both alive.

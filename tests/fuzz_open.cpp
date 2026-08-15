@@ -52,6 +52,7 @@ std::vector<std::byte> valid_image(std::mt19937_64& rng, fields& ids,
   options.value_interning = (rng() % 2) ? mmpack::interning_policy::always
                                         : mmpack::interning_policy::never;
   options.partition_remap = (rng() % 2) != 0;
+  options.partition_address_width = (rng() % 4) != 0;  // mostly on
 
   mmpack::table_builder tb(sb, options);
   // Half the images are built from caller-split parts, so they carry the
@@ -62,22 +63,30 @@ std::vector<std::byte> valid_image(std::mt19937_64& rng, fields& ids,
   // sometimes 2 bytes wide, which is what lets partitions actually remap.
   const int n = 1 + static_cast<int>(rng() % 3000);
   const unsigned tuple_space = 4 + static_cast<unsigned>(rng() % 400);
+  // How coarse the keys are. A nonzero shift zeroes the low bytes of every
+  // address, which is what makes partitions trim a prefix -- the region-start
+  // shape -- so the trimmed geometry gets corrupted too rather than only the
+  // untrimmed one.
+  const unsigned shift = 8 * static_cast<unsigned>(rng() % 3);
+  const unsigned wide_zeros = static_cast<unsigned>(rng() % 4);  // trailing zero bytes
   std::uint64_t key = 0;
   for (int i = 0; i < n; ++i) {
     key += 1 + rng() % 40;
+    const std::uint64_t address = key << shift;
     const unsigned t = static_cast<unsigned>(rng() % tuple_space);
     const unsigned bits = options.address_bits;
-    // A wide address is the low bits written big-endian into 12 bytes, so it
-    // stays ordered and drives the memcmp search path.
+    // A wide address is the key written big-endian into 12 bytes, leading and
+    // trailing bytes left zero, so it stays ordered, drives the memcmp search
+    // path, and trims at both ends.
     std::array<std::byte, 12> wide{};
-    for (int b = 0; b < 8; ++b) {
-      wide[4 + b] = static_cast<std::byte>((key >> (8 * (7 - b))) & 0xff);
+    for (unsigned b = 0; b + wide_zeros < 8; ++b) {
+      wide[4 + b] = static_cast<std::byte>((key >> (8 * (7 - wide_zeros - b))) & 0xff);
     }
     auto rec = key_style == 2
                    ? tb.begin_record_at(0, std::span<const std::byte>(wide))
                : key_style == 1
-                   ? tb.begin_record_at(key >> bits, key & ((1ull << bits) - 1))
-                   : tb.begin_record(key);
+                   ? tb.begin_record_at(address >> bits, address & ((1ull << bits) - 1))
+                   : tb.begin_record(address);
     rec.set_text(ids.country, countries[t % 5]);
     rec.set_text(ids.region, "region-" + std::to_string(t % 4));
     rec.set_uint(ids.population, 1000 + t);
@@ -101,6 +110,14 @@ std::uint64_t exercise(const mmpack::table& t, const fields& ids) {
     sink += it.partition();
     if (const auto a = it.address()) sink += *a;
     for (const std::byte b : it.address_bytes()) sink += static_cast<std::uint64_t>(b);
+    sink += it.address_skip();
+    // Rebuilding the full field writes at the partition's claimed offset, so a
+    // corrupt skip/width pair would land outside the buffer if open() let one
+    // through.
+    std::array<std::byte, 255> full{};
+    if (it.address_into(std::span<std::byte>(full.data(), t.address_width()))) {
+      for (unsigned b = 0; b < t.address_width(); ++b) sink += static_cast<std::uint64_t>(full[b]);
+    }
     if (const auto k = it.key()) sink += *k;  // empty on caller-split images
     if (auto v = t.uint(it, ids.population)) sink += *v;
     if (auto v = t.sint(it, ids.temp)) sink += static_cast<std::uint64_t>(*v);

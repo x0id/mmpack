@@ -58,6 +58,12 @@ struct build_options {
   /// images, and only where it pays for the table. This is stride reduction on
   /// the hot path, so it is on by default.
   bool partition_remap = true;
+  /// Store only the stretch of the address field a partition actually uses,
+  /// trimming bytes that are zero in every one of its records. Region-start
+  /// tables trim heavily -- IPv6 /64 starts leave two thirds of the field zero --
+  /// and like the remap this is pure stride reduction on the hot path, so it is
+  /// on by default.
+  bool partition_address_width = true;
   /// Round each field offset up to its own width. Off by default.
   bool align_fields = false;
   /// Stop deduplicating tuples once this many records have been seen and the
@@ -88,6 +94,11 @@ struct build_report {
   /// Partitions given a local remap table, and the record bytes that saved.
   std::uint64_t remapped_partitions = 0;
   std::uint64_t remap_saved_bytes = 0;
+  /// Address bytes actually stored across all records, against the
+  /// records * address_width a single global width would have cost.
+  std::uint64_t address_bytes_total = 0;
+  std::uint64_t address_saved_bytes = 0;
+  std::uint64_t narrowed_partitions = 0;
   /// Packed bytes per directory slot, once every field is narrowed to its range.
   std::uint32_t directory_stride = 0;
   /// Record-and-dictionary bytes each layout would have cost, for auditing.
@@ -654,23 +665,50 @@ class table_builder {
     ref_width_ = detail::width_for(distinct == 0 ? 0 : distinct - 1);
 
     // One walk over the staged records: the address width comes from the data
-    // rather than from address_bits, and per-partition distinct counts give the
-    // remap saving. Both are needed before the layout can be priced.
+    // rather than from address_bits, per-partition distinct counts give the
+    // remap saving, and the OR of each partition's addresses gives the stretch
+    // of the address field it actually needs. All three are wanted before the
+    // layout can be priced.
     std::uint64_t max_address = 0;
     std::uint64_t remap_savings = 0;
+    std::uint64_t address_bytes = 0;
+    partition_skip_.clear();
+    partition_width_.clear();
     {
       std::unordered_set<std::uint64_t> local;
+      std::vector<std::byte> or_bytes(blob_ != nullptr ? wide_width_ : 0, std::byte{0});
       const std::uint64_t n = staging_->size();
       std::uint64_t i = 0;
       while (i < n) {
         const std::uint64_t partition = staging_->partition_at(i);
         local.clear();
+        std::uint64_t or_bits = 0;
+        std::fill(or_bytes.begin(), or_bytes.end(), std::byte{0});
         std::uint64_t j = i;
         while (j < n && staging_->partition_at(j) == partition) {
-          max_address = std::max(max_address, staging_->address_at(j));
+          if (blob_ != nullptr) {
+            const auto a = staging_->address_bytes_at(j);
+            for (unsigned b = 0; b < wide_width_; ++b) or_bytes[b] |= a[b];
+          } else {
+            const std::uint64_t a = staging_->address_at(j);
+            max_address = std::max(max_address, a);
+            or_bits |= a;
+          }
           local.insert(staging_->tuple_at(j));
           ++j;
         }
+
+        unsigned skip = 0;
+        unsigned width = 0;
+        if (blob_ != nullptr) {
+          trim_bytes(or_bytes, skip, width);
+        } else {
+          trim_bits(or_bits, skip, width);
+        }
+        partition_skip_.push_back(static_cast<std::uint8_t>(skip));
+        partition_width_.push_back(static_cast<std::uint8_t>(width));
+        address_bytes += (j - i) * width;
+
         std::uint64_t saved = 0;
         (void)plan_remap(local.size(), j - i, saved);  // only the saving matters here
         remap_savings += saved;
@@ -678,15 +716,33 @@ class table_builder {
       }
     }
     // A wide build already fixed its width; a narrow one takes the narrowest
-    // that holds the largest address seen.
-    address_width_ = blob_ != nullptr ? wide_width_ : detail::width_for(max_address);
+    // that holds the largest address seen. Exact rather than snapped to
+    // 1/2/4/8, because the reader loads the address through a mask where every
+    // width costs the same.
+    address_width_ = blob_ != nullptr ? wide_width_ : detail::exact_width_for(max_address);
+
+    if (!options_.partition_address_width) {
+      std::fill(partition_skip_.begin(), partition_skip_.end(), std::uint8_t{0});
+      std::fill(partition_width_.begin(), partition_width_.end(),
+                static_cast<std::uint8_t>(address_width_));
+      address_bytes = count_ * address_width_;
+    }
+    for (std::size_t p = 0; p < partition_width_.size(); ++p) {
+      if (partition_width_[p] != address_width_ || partition_skip_[p] != 0) {
+        ++report.narrowed_partitions;
+      }
+    }
+    report.address_bytes_total = address_bytes;
+    report.address_saved_bytes = count_ * address_width_ - address_bytes;
 
     // The cost model. Dictionary bytes for text fields are the same either way,
     // so they cancel and only records plus the composite dictionary matter.
     // Remap savings belong on the interned side, or the model would price a
-    // layout it is not actually going to write.
-    const std::uint64_t inline_bytes = count_ * (address_width_ + value_stride_);
-    std::uint64_t interned_bytes = count_ * (address_width_ + ref_width_) +
+    // layout it is not actually going to write. The address term is the same on
+    // both sides and so cancels for the decision, but it has to be right for the
+    // estimates to mean anything.
+    const std::uint64_t inline_bytes = address_bytes + count_ * value_stride_;
+    std::uint64_t interned_bytes = address_bytes + count_ * ref_width_ +
                                    fixed_dictionary_size(distinct, value_stride_);
     interned_bytes -= std::min(interned_bytes, remap_savings);
 
@@ -705,6 +761,49 @@ class table_builder {
     report.record_stride = record_stride_;
     report.inline_estimate = inline_bytes;
     report.interned_estimate = interned_bytes;
+  }
+
+  // The stretch of the address field a partition actually uses, taken from the
+  // OR of every address in it: from the first nonzero byte to the last. Whatever
+  // lies outside is zero in every record, so trimming it loses nothing and
+  // zero-extension on read is exact.
+  //
+  // Which end pays off depends on the encoding, and both are worth having. A
+  // little-endian integer puts a region start's low-order zeros at the *front*
+  // of the field (IPv4 10.0.0.0 is 00 00 00 0A) and its small-magnitude zeros at
+  // the back; a big-endian byte string is the other way round. Stating the rule
+  // in byte positions rather than in significance covers both without caring.
+  //
+  /// All-zero means the partition holds one record whose address is zero, and
+  /// nothing at all needs storing for it.
+  static void trim_bits(std::uint64_t bits, unsigned& skip, unsigned& width) noexcept {
+    if (bits == 0) {
+      skip = 0;
+      width = 0;
+      return;
+    }
+    skip = 0;
+    while ((bits & 0xff) == 0) {
+      bits >>= 8;
+      ++skip;
+    }
+    width = detail::exact_width_for(bits);
+  }
+
+  static void trim_bytes(const std::vector<std::byte>& or_bytes, unsigned& skip,
+                         unsigned& width) noexcept {
+    const auto n = static_cast<unsigned>(or_bytes.size());
+    unsigned lo = 0;
+    while (lo < n && or_bytes[lo] == std::byte{0}) ++lo;
+    if (lo == n) {
+      skip = 0;
+      width = 0;
+      return;
+    }
+    unsigned hi = n;
+    while (hi > lo && or_bytes[hi - 1] == std::byte{0}) --hi;
+    skip = lo;
+    width = hi - lo;
   }
 
   /// Local reference width for a partition holding `distinct_here` distinct
@@ -817,11 +916,19 @@ class table_builder {
     std::unordered_map<std::uint64_t, std::uint32_t> to_local;    // global -> local
     const std::uint64_t rows = staging_->size();
     std::uint64_t i = 0;
+    std::size_t run = 0;  ///< indexes the per-partition ranges choose_layout derived
     while (i < rows) {
       const std::uint64_t partition = staging_->partition_at(i);
       std::uint64_t j = i;
       while (j < rows && staging_->partition_at(j) == partition) ++j;
       const std::uint64_t count = j - i;
+
+      // This walk must visit partitions in exactly the order choose_layout did,
+      // or the widths the layout was priced at would not be the ones written.
+      if (run >= partition_width_.size()) throw build_error("partition ranges out of step");
+      const unsigned addr_skip = partition_skip_[run];
+      const unsigned addr_width = partition_width_[run];
+      ++run;
 
       std::uint32_t schema_id = remap::none;
       remap_table.clear();
@@ -846,7 +953,8 @@ class table_builder {
       }
 
       directory.push_back(dir_entry{partition, pos, count, schema_id,
-                                    static_cast<std::uint32_t>(remap_table.size())});
+                                    static_cast<std::uint32_t>(remap_table.size()),
+                                    addr_width, addr_skip});
 
       for (const std::uint64_t global : remap_table) {
         const auto id = static_cast<std::uint32_t>(global);
@@ -854,27 +962,32 @@ class table_builder {
       }
 
       const unsigned width = schema_id != remap::none ? schema_id : ref_width_;
-      const std::size_t stride =
-          interned_ ? address_width_ + width : address_width_ + value_stride_;
+      const std::size_t stride = addr_width + (interned_ ? width : value_stride_);
       for (std::uint64_t k = i; k < j; ++k) {
         std::memset(record.data(), 0, stride);
+        // Only the stretch this partition uses. For bytes that is a window into
+        // the address; for an integer it is the value shifted down past the
+        // low-order bytes that are zero throughout the partition.
         if (blob_ != nullptr) {
           const auto bytes = staging_->address_bytes_at(k);
-          std::memcpy(record.data(), bytes.data(), bytes.size());
+          std::memcpy(record.data(), bytes.data() + addr_skip, addr_width);
         } else {
-          detail::store_uint(record.data(), address_width_, staging_->address_at(k));
+          const std::uint64_t address = staging_->address_at(k);
+          detail::store_uint(record.data(), addr_width,
+                             addr_skip >= 8 ? 0 : address >> (8 * addr_skip));
         }
         if (interned_) {
           const std::uint64_t global = staging_->tuple_at(k);
           const std::uint64_t ref = schema_id != remap::none ? to_local[global] : global;
-          detail::store_uint(record.data() + address_width_, width, ref);
+          detail::store_uint(record.data() + addr_width, width, ref);
         } else {
-          encode_tuple(staging_->tuple_at(k), record.data() + address_width_);
+          encode_tuple(staging_->tuple_at(k), record.data() + addr_width);
         }
         emit(record.data(), stride);
       }
       i = j;
     }
+    if (run != partition_width_.size()) throw build_error("partition ranges out of step");
 
     pad_to(8);
     const std::uint64_t dir_offset = pos;
@@ -883,17 +996,24 @@ class table_builder {
     // Narrow every directory field to what this image actually needs. A dense
     // directory drops the partition entirely: slot i describes partition i, so
     // storing it would only be a value to check against its own index.
-    std::uint64_t max_partition = 0, max_offset = 0, max_count = 0, max_remap = 0;
+    std::uint64_t max_partition = 0, max_offset = 0, max_count = 0, max_remap = 0, max_skip = 0;
+    bool trimmed = false;
     for (const dir_entry& d : directory) {
       max_partition = std::max(max_partition, d.partition);
       max_offset = std::max(max_offset, d.offset);
       max_count = std::max(max_count, d.count);
       max_remap = std::max<std::uint64_t>(max_remap, d.remap_count);
+      max_skip = std::max<std::uint64_t>(max_skip, d.address_skip);
+      if (d.address_width != address_width_) trimmed = true;
     }
+    // Both address fields are omitted unless some partition departs from the
+    // global width, so an image with nothing to trim is exactly as wide as it
+    // was before the feature existed.
     dir_ = make_dir_layout(dense ? 0u : detail::width_for(max_partition),
                            detail::width_for(max_offset), detail::width_for(max_count),
                            max_remap != 0 ? 1u : 0u,
-                           max_remap != 0 ? detail::width_for(max_remap) : 0u);
+                           max_remap != 0 ? detail::width_for(max_remap) : 0u,
+                           trimmed ? 1u : 0u, max_skip != 0 ? 1u : 0u);
 
     std::vector<std::byte> slot(dir_.stride);
     std::uint64_t dir_count = 0;
@@ -905,7 +1025,11 @@ class table_builder {
     if (dense) {
       std::uint64_t next = 0;
       for (const dir_entry& d : directory) {
-        for (; next < d.partition; ++next) emit_slot(dir_entry{next, 0, 0, 0, 0});
+        // A gap slot holds no records, but its address range still has to be a
+        // legal one so the invariant holds for every slot without exception.
+        for (; next < d.partition; ++next) {
+          emit_slot(dir_entry{next, 0, 0, 0, 0, address_width_, 0});
+        }
         emit_slot(d);
         next = d.partition + 1;
       }
@@ -968,6 +1092,8 @@ class table_builder {
     head.dir_offset_width = static_cast<std::uint8_t>(dir_.offset_width);
     head.dir_count_width = static_cast<std::uint8_t>(dir_.count_width);
     head.dir_remap_width = static_cast<std::uint8_t>(dir_.remap_width);
+    head.dir_addr_width = static_cast<std::uint8_t>(dir_.addr_width);
+    head.dir_skip_width = static_cast<std::uint8_t>(dir_.skip_width);
 
     emit(&head, sizeof(head));
     if (!out.empty()) emit(out.data(), out.size() * sizeof(field_desc));
@@ -992,6 +1118,11 @@ class table_builder {
   std::unordered_set<std::uint64_t, tuple_hash, tuple_equal> index_;
   std::vector<field_desc> descs_;
   dir_layout dir_;  ///< settled once the directory's value ranges are known
+  /// The address range each partition stores, in partition-run order. Derived in
+  /// choose_layout and indexed again by the writer, so that the layout priced
+  /// and the layout written cannot drift apart.
+  std::vector<std::uint8_t> partition_skip_;
+  std::vector<std::uint8_t> partition_width_;
 
   std::uint64_t count_ = 0;
   std::uint64_t last_partition_ = 0;

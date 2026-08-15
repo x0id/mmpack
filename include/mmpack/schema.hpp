@@ -91,8 +91,11 @@ struct schema_header {
   std::uint8_t dir_offset_width;
   std::uint8_t dir_count_width;
   std::uint8_t dir_remap_width;      ///< 0 when no partition is remapped
+  std::uint8_t dir_addr_width;       ///< 0 when every partition stores address_width bytes
+  std::uint8_t dir_skip_width;       ///< 0 when no partition trims a prefix
+  std::uint8_t reserved0[2];
 };
-static_assert(sizeof(schema_header) == 36, "schema_header must be padding-free");
+static_assert(sizeof(schema_header) == 40, "schema_header must be padding-free");
 
 struct field_desc {
   std::uint32_t offset;       ///< byte offset within the value tuple
@@ -211,6 +214,10 @@ class schema_view {
     if (head.dir_remap_width != 0 && !detail::is_valid_width(head.dir_remap_width)) {
       return std::nullopt;
     }
+    // Both per-partition address fields hold a byte count bounded by
+    // address_width, itself a uint8, so one byte always suffices and anything
+    // wider is a corrupt image rather than a format the reader has yet to meet.
+    if (head.dir_addr_width > 1 || head.dir_skip_width > 1) return std::nullopt;
     if (head.mode > static_cast<std::uint8_t>(value_mode::interned)) return std::nullopt;
     if (head.value_stride == 0 && head.field_count != 0) return std::nullopt;
 
@@ -298,7 +305,15 @@ class schema_view {
   [[nodiscard]] dir_layout directory_layout() const noexcept {
     const unsigned schema_width = head_.dir_remap_width != 0 ? 1u : 0u;
     return make_dir_layout(head_.dir_partition_width, head_.dir_offset_width,
-                           head_.dir_count_width, schema_width, head_.dir_remap_width);
+                           head_.dir_count_width, schema_width, head_.dir_remap_width,
+                           head_.dir_addr_width, head_.dir_skip_width);
+  }
+
+  /// Whether any partition stores less than the full address field. False makes
+  /// both per-partition directory fields absent, which is what keeps images
+  /// without trimming exactly as wide as they were before it existed.
+  [[nodiscard]] bool trims_addresses() const noexcept {
+    return head_.dir_addr_width != 0 || head_.dir_skip_width != 0;
   }
 
   [[nodiscard]] field_desc field(field_id id) const noexcept {

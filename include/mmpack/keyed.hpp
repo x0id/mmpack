@@ -1,6 +1,9 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <span>
 #include <type_traits>
 #include <utility>
 
@@ -91,6 +94,13 @@ class keyed_table {
   /// images whose addresses fit one, the raw bytes otherwise. A join written for
   /// wide keys therefore works unchanged on a narrow image and vice versa,
   /// provided it takes the form that image actually has.
+  ///
+  /// The byte form is rebuilt at the full address width rather than passed
+  /// through from the record, because a partition may store only the significant
+  /// stretch of it. Handing a join the trimmed bytes would silently give it a
+  /// different key than the one that was written. address_width() is a uint8 in
+  /// the schema, so 255 bytes is a hard upper bound and this stays a stack copy;
+  /// key reconstruction is not a hot path.
   template <class J = Join>
   [[nodiscard]] Key key(const const_iterator& it) const
     requires(!std::is_same_v<J, no_join>)
@@ -98,7 +108,10 @@ class keyed_table {
     if constexpr (std::is_invocable_r_v<Key, const J&, std::uint64_t, std::uint64_t>) {
       return join_(it.partition(), it.address().value());
     } else {
-      return join_(it.partition(), it.address_bytes());
+      std::array<std::byte, 255> buffer;
+      const std::span<std::byte> full(buffer.data(), table_->address_width());
+      (void)it.address_into(full);
+      return join_(it.partition(), std::span<const std::byte>(full));
     }
   }
 

@@ -108,6 +108,7 @@ std::unique_ptr<built> build(const std::vector<row>& rows, mmpack::build_options
 struct dir_access {
   mmpack::footer foot{};
   mmpack::dir_layout layout{};
+  unsigned address_width = 0;  ///< supplies the slot width when no slot stores one
 };
 
 dir_access open_directory(const std::vector<std::byte>& image) {
@@ -116,13 +117,14 @@ dir_access open_directory(const std::vector<std::byte>& image) {
   out.foot =
       mmpack::detail::load<mmpack::footer>(image.data() + image.size() - sizeof(mmpack::footer));
   out.layout = t.schema().directory_layout();
+  out.address_width = t.address_width();
   return out;
 }
 
 mmpack::dir_entry get_slot(const std::vector<std::byte>& image, const dir_access& a,
                            std::uint64_t i) {
   return mmpack::decode_dir_entry(image.data() + a.foot.dir_offset + i * a.layout.stride, a.layout,
-                                  i);
+                                  i, a.address_width);
 }
 
 void put_slot(std::vector<std::byte>& image, const dir_access& a, std::uint64_t i,
@@ -1669,6 +1671,538 @@ void test_wide_address_corruption() {
   }
 }
 
+// --- per-partition address trimming -----------------------------------------
+
+using addr12 = std::array<std::byte, 12>;
+
+/// Big-endian, so byte 0 is the most significant -- the encoding the wide
+/// comparison requires.
+addr12 make_addr12(std::initializer_list<unsigned> leading) {
+  addr12 out{};
+  std::size_t i = 0;
+  for (const unsigned b : leading) out[i++] = static_cast<std::byte>(b);
+  return out;
+}
+
+std::span<const std::byte> as_span12(const addr12& a) { return {a.data(), a.size()}; }
+
+/// The case that is easiest to get exactly backwards, and that an earlier draft
+/// of this design did: a little-endian integer address whose *low-order* bytes
+/// are zero. That is what a table of region starts looks like, and those zeros
+/// sit at the front of the field in memory -- so trimming them means skipping a
+/// prefix, not shortening a tail. Trimming the tail instead would keep the zeros
+/// and throw away the significant byte.
+void test_narrow_low_order_trim() {
+  std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t> oracle;
+  for (std::uint64_t i = 1; i <= 1000; ++i) oracle[{0, i << 16}] = i;         // /16-aligned
+  for (std::uint64_t i = 1; i <= 1000; ++i) oracle[{1, i}] = i + 5000;        // unaligned
+  oracle[{2, 0xff000000ull}] = 99;  // fixes the global width at 4
+
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, {});
+  for (const auto& [k, v] : oracle) {
+    auto rec = tb.begin_record_at(k.first, k.second);
+    rec.set_uint(f, v);
+    tb.commit(rec);
+  }
+  const auto report = tb.finish(sink);
+  CHECK(report.address_width == 4);
+  CHECK(report.narrowed_partitions == 3);
+
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  CHECK(t.trims_addresses());
+  CHECK(t.address_width() == 4);
+  const auto id = t.field("v").value();
+
+  // The stored range of each partition, read back through the real layout.
+  const dir_access acc = open_directory(sink.bytes());
+  const auto p0 = get_slot(sink.bytes(), acc, 0);
+  const auto p1 = get_slot(sink.bytes(), acc, 1);
+  const auto p2 = get_slot(sink.bytes(), acc, 2);
+  CHECK(p0.address_skip == 2 && p0.address_width == 2);  // i << 16, i <= 1000
+  CHECK(p1.address_skip == 0 && p1.address_width == 2);  // i <= 1000
+  CHECK(p2.address_skip == 3 && p2.address_width == 1);  // 0xff000000
+
+  // Storing two bytes where a global width would have stored four.
+  CHECK(report.address_bytes_total == 2 * 1000 + 2 * 1000 + 1);
+  CHECK(report.address_saved_bytes == 4 * oracle.size() - report.address_bytes_total);
+
+  for (const auto& [k, v] : oracle) {
+    const auto it = t.find_at(k.first, k.second);
+    CHECK(it != t.end());
+    if (it == t.end()) continue;
+    CHECK(it.partition() == k.first);
+    CHECK(it.address().value() == k.second);  // the trimmed bytes come back
+    CHECK(t.uint(it, id).value() == v);
+  }
+
+  // Iteration order and every lookup form against the oracle.
+  auto want = oracle.begin();
+  for (auto it = t.begin(); it != t.end(); ++it, ++want) {
+    CHECK(it.partition() == want->first.first);
+    CHECK(it.address().value() == want->first.second);
+  }
+  CHECK(want == oracle.end());
+
+  std::mt19937_64 rng(4242);
+  for (int i = 0; i < 4000; ++i) {
+    const std::uint64_t p = rng() % 4;
+    const std::uint64_t a = (rng() % 4 == 0) ? (rng() % 1200) << 16 : rng() % 0x1000000ull;
+
+    const auto lb = t.lower_bound_at(p, a);
+    const auto expect_lb = oracle.lower_bound({p, a});
+    CHECK((lb == t.end()) == (expect_lb == oracle.end()));
+    if (lb != t.end() && expect_lb != oracle.end()) {
+      CHECK(lb.partition() == expect_lb->first.first);
+      CHECK(lb.address().value() == expect_lb->first.second);
+    }
+
+    const auto fl = t.floor_at(p, a);
+    const auto above = oracle.upper_bound({p, a});
+    if (above == oracle.begin()) {
+      CHECK(fl == t.end());
+    } else {
+      const auto expect = std::prev(above);
+      CHECK(fl != t.end());
+      if (fl != t.end()) {
+        CHECK(fl.partition() == expect->first.first);
+        CHECK(fl.address().value() == expect->first.second);
+      }
+    }
+  }
+}
+
+/// The wide half of the same rule, on IPv6-shaped data: a /32 partition with a
+/// 12-byte remainder, where region starts leave the tail zero.
+void test_wide_partition_trim() {
+  std::map<std::pair<std::uint64_t, addr12>, std::uint64_t> oracle;
+  std::mt19937_64 rng(31337);
+
+  // /64 starts: only the first four bytes ever vary.
+  for (unsigned i = 1; i <= 300; ++i) {
+    oracle[{0, make_addr12({i >> 8, i & 0xff, static_cast<unsigned>(rng() & 0xff),
+                            static_cast<unsigned>(rng() & 0xff)})}] = i;
+  }
+  // Full depth: every byte varies, so nothing can be trimmed.
+  for (unsigned i = 0; i < 300; ++i) {
+    addr12 a{};
+    for (auto& b : a) b = static_cast<std::byte>(rng() & 0xff);
+    oracle[{1, a}] = 1000 + i;
+  }
+  // Trimmed at both ends at once: bytes 0-1 zero, 4-11 zero.
+  for (unsigned i = 1; i <= 300; ++i) {
+    addr12 a{};
+    a[2] = static_cast<std::byte>(i >> 8);
+    a[3] = static_cast<std::byte>(i & 0xff);
+    oracle[{2, a}] = 2000 + i;
+  }
+
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, {});
+  for (const auto& [k, v] : oracle) {
+    auto rec = tb.begin_record_at(k.first, as_span12(k.second));
+    rec.set_uint(f, v);
+    tb.commit(rec);
+  }
+  const auto report = tb.finish(sink);
+  CHECK(report.address_width == 12);
+
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  CHECK(!t.narrow_address());
+  CHECK(t.trims_addresses());
+  const auto id = t.field("v").value();
+
+  const dir_access acc = open_directory(sink.bytes());
+  const auto p0 = get_slot(sink.bytes(), acc, 0);
+  const auto p1 = get_slot(sink.bytes(), acc, 1);
+  const auto p2 = get_slot(sink.bytes(), acc, 2);
+  CHECK(p0.address_skip == 0 && p0.address_width == 4);
+  CHECK(p1.address_skip == 0 && p1.address_width == 12);
+  CHECK(p2.address_skip == 2 && p2.address_width == 2);  // both ends trimmed
+
+  for (const auto& [k, v] : oracle) {
+    const auto it = t.find_at(k.first, as_span12(k.second));
+    CHECK(it != t.end());
+    if (it == t.end()) continue;
+    CHECK(t.uint(it, id).value() == v);
+    // address_bytes() is only the stored stretch; address_into() is the field.
+    CHECK(it.address_bytes().size() ==
+          (k.first == 0 ? 4u : k.first == 1 ? 12u : 2u));
+    CHECK(it.address_skip() == (k.first == 2 ? 2u : 0u));
+    addr12 full{};
+    CHECK(it.address_into(std::span<std::byte>(full.data(), full.size())));
+    CHECK(full == k.second);
+  }
+
+  // Every ordered query form against the oracle, including probes that fall in
+  // the trimmed regions.
+  for (int i = 0; i < 5000; ++i) {
+    const std::uint64_t p = rng() % 4;
+    addr12 probe{};
+    switch (rng() % 3) {
+      case 0:  // deep in the tail: exercises the tail tiebreak
+        probe[0] = static_cast<std::byte>(rng() & 0xff);
+        probe[1] = static_cast<std::byte>(rng() & 0xff);
+        probe[11] = static_cast<std::byte>(rng() | 1u);
+        break;
+      case 1:  // high in the head: exercises the head shortcut
+        for (auto& b : probe) b = static_cast<std::byte>(rng() & 0xff);
+        break;
+      default:
+        probe[2] = static_cast<std::byte>(rng() & 0xff);
+        probe[3] = static_cast<std::byte>(rng() & 0xff);
+        break;
+    }
+
+    const auto lb = t.lower_bound_at(p, as_span12(probe));
+    const auto expect_lb = oracle.lower_bound({p, probe});
+    CHECK((lb == t.end()) == (expect_lb == oracle.end()));
+    if (lb != t.end() && expect_lb != oracle.end()) {
+      addr12 got{};
+      CHECK(lb.address_into(std::span<std::byte>(got.data(), got.size())));
+      CHECK(lb.partition() == expect_lb->first.first);
+      CHECK(got == expect_lb->first.second);
+    }
+
+    const auto ub = t.upper_bound_at(p, as_span12(probe));
+    const auto expect_ub = oracle.upper_bound({p, probe});
+    CHECK((ub == t.end()) == (expect_ub == oracle.end()));
+    if (ub != t.end() && expect_ub != oracle.end()) {
+      addr12 got{};
+      CHECK(ub.address_into(std::span<std::byte>(got.data(), got.size())));
+      CHECK(ub.partition() == expect_ub->first.first);
+      CHECK(got == expect_ub->first.second);
+    }
+
+    const auto found = t.find_at(p, as_span12(probe));
+    CHECK((found != t.end()) == (oracle.count({p, probe}) != 0));
+
+    const auto fl = t.floor_at(p, as_span12(probe));
+    if (expect_ub == oracle.begin()) {
+      CHECK(fl == t.end());
+    } else {
+      const auto expect = std::prev(expect_ub);
+      CHECK(fl != t.end());
+      if (fl != t.end()) {
+        addr12 got{};
+        CHECK(fl.address_into(std::span<std::byte>(got.data(), got.size())));
+        CHECK(fl.partition() == expect->first.first);
+        CHECK(got == expect->first.second);
+      }
+    }
+  }
+}
+
+/// The two tiebreaks in isolation. Without them a probe landing in a trimmed
+/// region compares equal to a record it is not equal to, which is the kind of
+/// bug a randomized oracle can miss for a long time.
+void test_trim_probe_edges() {
+  // Wide: partition 0 stores bytes 2..3 only, so bytes 0-1 are the head region
+  // and 4..11 the tail.
+  std::map<std::pair<std::uint64_t, addr12>, std::uint64_t> oracle;
+  for (unsigned i = 1; i <= 5; ++i) {
+    addr12 a{};
+    a[2] = static_cast<std::byte>(i);
+    oracle[{0, a}] = i;
+  }
+  addr12 deep{};  // a second partition, so "past the end" has somewhere to go
+  deep[0] = std::byte{0x7f};
+  oracle[{1, deep}] = 99;
+
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, {});
+  for (const auto& [k, v] : oracle) {
+    auto rec = tb.begin_record_at(k.first, as_span12(k.second));
+    rec.set_uint(f, v);
+    tb.commit(rec);
+  }
+  (void)tb.finish(sink);
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+
+  const dir_access acc = open_directory(sink.bytes());
+  const auto p0 = get_slot(sink.bytes(), acc, 0);
+  CHECK(p0.address_skip == 2 && p0.address_width == 1);
+
+  // tail: equal on the stored range, but with something below it. The record is
+  // strictly less, so find misses, lower_bound steps past it, floor returns it.
+  addr12 tail{};
+  tail[2] = std::byte{3};
+  tail[7] = std::byte{1};
+  CHECK(t.find_at(0, as_span12(tail)) == t.end());
+  {
+    const auto lb = t.lower_bound_at(0, as_span12(tail));
+    CHECK(lb != t.end());
+    if (lb != t.end()) CHECK(t.uint(lb, f).value() == 4);  // stepped past 3
+    const auto fl = t.floor_at(0, as_span12(tail));
+    CHECK(fl != t.end());
+    if (fl != t.end()) CHECK(t.uint(fl, f).value() == 3);
+    const auto ub = t.upper_bound_at(0, as_span12(tail));
+    CHECK(ub != t.end());
+    if (ub != t.end()) CHECK(t.uint(ub, f).value() == 4);
+  }
+
+  // head: something above the stored range puts the probe past every record in
+  // the partition, whatever the stored bytes say.
+  addr12 head{};
+  head[0] = std::byte{1};
+  head[2] = std::byte{1};  // would compare equal to record 1 on the stored range
+  CHECK(t.find_at(0, as_span12(head)) == t.end());
+  {
+    const auto lb = t.lower_bound_at(0, as_span12(head));
+    CHECK(lb != t.end());
+    if (lb != t.end()) CHECK(lb.partition() == 1);  // fell through to the next
+    const auto fl = t.floor_at(0, as_span12(head));
+    CHECK(fl != t.end());
+    if (fl != t.end()) CHECK(t.uint(fl, f).value() == 5);  // the partition's last
+  }
+
+  // Narrow: the same two situations on an integer address.
+  std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t> narrow;
+  for (std::uint64_t i = 1; i <= 5; ++i) narrow[{0, i << 16}] = i;
+  narrow[{1, 0xff000000ull}] = 99;
+
+  mmpack::schema_builder nsb;
+  const auto nf = nsb.add_uint("v");
+  mmpack::vector_sink nsink;
+  mmpack::table_builder ntb(nsb, {});
+  for (const auto& [k, v] : narrow) {
+    auto rec = ntb.begin_record_at(k.first, k.second);
+    rec.set_uint(nf, v);
+    ntb.commit(rec);
+  }
+  (void)ntb.finish(nsink);
+  const auto nt = mmpack::table::open(nsink.data(), nsink.size());
+
+  CHECK(nt.find_at(0, (3ull << 16) | 1) == nt.end());  // low bits nothing can hold
+  {
+    const auto lb = nt.lower_bound_at(0, (3ull << 16) | 1);
+    CHECK(lb != nt.end());
+    if (lb != nt.end()) CHECK(lb.address().value() == 4ull << 16);
+    const auto fl = nt.floor_at(0, (3ull << 16) | 1);
+    CHECK(fl != nt.end());
+    if (fl != nt.end()) CHECK(fl.address().value() == 3ull << 16);
+  }
+  {
+    // Above everything the stored range can express: the loop must run out
+    // rather than wrap into a comparison that happens to match.
+    const auto lb = nt.lower_bound_at(0, 0x1'0000'0000ull);
+    CHECK(lb != nt.end());
+    if (lb != nt.end()) CHECK(lb.partition() == 1);
+    const auto fl = nt.floor_at(0, 0x1'0000'0000ull);
+    CHECK(fl != nt.end());
+    if (fl != nt.end()) CHECK(fl.address().value() == 5ull << 16);
+  }
+}
+
+/// A partition whose only record has an all-zero address stores no address
+/// bytes at all. 80% of partitions in the real /32 IPv6 image are this shape.
+void test_trim_zero_width() {
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, {});
+  {
+    auto rec = tb.begin_record_at(0, std::uint64_t{0});  // the whole partition
+    rec.set_uint(f, 7);
+    tb.commit(rec);
+  }
+  for (std::uint64_t i = 1; i <= 20; ++i) {
+    auto rec = tb.begin_record_at(1, i << 8);
+    rec.set_uint(f, i);
+    tb.commit(rec);
+  }
+  const auto report = tb.finish(sink);
+
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  const dir_access acc = open_directory(sink.bytes());
+  const auto p0 = get_slot(sink.bytes(), acc, 0);
+  CHECK(p0.address_width == 0 && p0.address_skip == 0);
+  CHECK(report.address_width == 2);
+
+  const auto id = t.field("v").value();
+  const auto hit = t.find_at(0, std::uint64_t{0});
+  CHECK(hit != t.end());
+  if (hit != t.end()) {
+    CHECK(hit.address().value() == 0);
+    CHECK(hit.address_bytes().empty());
+    CHECK(t.uint(hit, id).value() == 7);
+  }
+  // Anything above zero is above the whole partition.
+  CHECK(t.find_at(0, std::uint64_t{1}) == t.end());
+  const auto lb = t.lower_bound_at(0, std::uint64_t{1});
+  CHECK(lb != t.end());
+  if (lb != t.end()) CHECK(lb.partition() == 1);
+  const auto fl = t.floor_at(0, std::uint64_t{1});
+  CHECK(fl != t.end());
+  if (fl != t.end()) CHECK(fl.address().value() == 0);
+}
+
+/// With nothing to trim, both directory fields stay absent and the image is
+/// byte-for-byte what it was with the feature switched off.
+void test_trim_costs_nothing_when_uniform() {
+  std::mt19937_64 rng(555);
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> keys;
+  for (std::uint64_t p = 0; p < 8; ++p) {
+    for (int i = 0; i < 200; ++i) keys.push_back({p, rng() & 0xffffffffull});
+  }
+  std::sort(keys.begin(), keys.end());
+  keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+
+  const auto build = [&](bool trim) {
+    mmpack::schema_builder sb;
+    const auto f = sb.add_uint("v");
+    mmpack::build_options options;
+    options.partition_address_width = trim;
+    mmpack::vector_sink sink;
+    mmpack::table_builder tb(sb, options);
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      auto rec = tb.begin_record_at(keys[i].first, keys[i].second);
+      rec.set_uint(f, i % 97);
+      tb.commit(rec);
+    }
+    (void)tb.finish(sink);
+    return sink.bytes();
+  };
+
+  const auto with_trim = build(true);
+  const auto without = build(false);
+  CHECK(with_trim == without);  // random addresses leave nothing to trim
+
+  const auto t = mmpack::table::open(with_trim.data(), with_trim.size());
+  CHECK(!t.trims_addresses());
+  CHECK(t.schema().directory_layout().addr_width == 0);
+  CHECK(t.schema().directory_layout().skip_width == 0);
+
+  // And switching it off on data that *could* trim gives the old layout back.
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::build_options options;
+  options.partition_address_width = false;
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, options);
+  for (std::uint64_t i = 1; i <= 100; ++i) {
+    auto rec = tb.begin_record_at(0, i << 16);
+    rec.set_uint(f, i);
+    tb.commit(rec);
+  }
+  const auto report = tb.finish(sink);
+  CHECK(report.narrowed_partitions == 0);
+  CHECK(report.address_bytes_total == 100 * report.address_width);
+  const auto plain = mmpack::table::open(sink.data(), sink.size());
+  CHECK(!plain.trims_addresses());
+  for (std::uint64_t i = 1; i <= 100; ++i) {
+    const auto it = plain.find_at(0, i << 16);
+    CHECK(it != plain.end());
+    if (it != plain.end()) CHECK(it.address().value() == i << 16);
+  }
+}
+
+/// Trimming and value remap are independent, and a partition can carry both.
+void test_trim_with_remap() {
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::build_options options;
+  options.value_interning = mmpack::interning_policy::always;
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, options);
+  // Many partitions so the global tuple id needs more than a byte, each holding
+  // few distinct values so a local table pays -- the remap fixture -- and
+  // /16-aligned addresses so there is also a prefix to skip.
+  for (std::uint64_t p = 0; p < 60; ++p) {
+    for (std::uint64_t i = 1; i <= 40; ++i) {
+      auto rec = tb.begin_record_at(p, i << 16);
+      rec.set_uint(f, p * 5 + (i % 5));
+      tb.commit(rec);
+    }
+  }
+  const auto report = tb.finish(sink);
+  CHECK(report.interned);
+  CHECK(report.remapped_partitions > 0);
+  CHECK(report.narrowed_partitions == 60);
+
+  const auto t = mmpack::table::open(sink.data(), sink.size());
+  const auto id = t.field("v").value();
+  const dir_access acc = open_directory(sink.bytes());
+  const auto slot0 = get_slot(sink.bytes(), acc, 0);
+  CHECK(slot0.schema_id != mmpack::remap::none);  // remapped
+  CHECK(slot0.address_skip == 2);                 // and trimmed
+  for (std::uint64_t p = 0; p < 60; ++p) {
+    for (std::uint64_t i = 1; i <= 40; ++i) {
+      const auto it = t.find_at(p, i << 16);
+      CHECK(it != t.end());
+      if (it == t.end()) continue;
+      CHECK(it.address().value() == i << 16);
+      CHECK(t.uint(it, id).value() == p * 5 + (i % 5));
+    }
+  }
+}
+
+/// A stored range outside the address field must be refused, however it is
+/// spelled -- otherwise the record stride and the zero-fill in address_into()
+/// would both be computed from a lie.
+void test_trim_corruption() {
+  mmpack::schema_builder sb;
+  const auto f = sb.add_uint("v");
+  mmpack::vector_sink sink;
+  mmpack::table_builder tb(sb, {});
+  for (std::uint64_t p = 0; p < 4; ++p) {
+    for (std::uint64_t i = 1; i <= 50; ++i) {
+      auto rec = tb.begin_record_at(p, i << 16);
+      rec.set_uint(f, i);
+      tb.commit(rec);
+    }
+  }
+  (void)tb.finish(sink);
+  const std::vector<std::byte>& image = sink.bytes();
+  CHECK(mmpack::table::try_open(image.data(), image.size()).has_value());
+
+  const dir_access acc = open_directory(image);
+  CHECK(acc.layout.addr_width == 1);
+  CHECK(acc.layout.skip_width == 1);
+
+  const auto rejects = [&](auto mutate) {
+    auto corrupt = image;
+    auto d = get_slot(corrupt, acc, 0);
+    mutate(d);
+    put_slot(corrupt, acc, 0, d);
+    mmpack::status s = mmpack::status::ok;
+    const auto opened = mmpack::table::try_open(corrupt.data(), corrupt.size(), &s);
+    CHECK(!opened.has_value());
+  };
+
+  rejects([](mmpack::dir_entry& d) { d.address_width = 250; });          // past the field
+  rejects([](mmpack::dir_entry& d) { d.address_skip = 250; });           // past the field
+  rejects([](mmpack::dir_entry& d) { d.address_skip = 3; });             // skip + width > 4
+  rejects([](mmpack::dir_entry& d) {
+    d.address_width = 4;  // a wider stride than the partition's extent allows
+    d.address_skip = 0;
+  });
+
+  // Shrinking the stored width without moving anything else leaves the records
+  // consistent but shorter, which must not be read as the original layout.
+  {
+    auto corrupt = image;
+    auto d = get_slot(corrupt, acc, 0);
+    d.address_width = 1;
+    put_slot(corrupt, acc, 0, d);
+    const auto opened = mmpack::table::try_open(corrupt.data(), corrupt.size());
+    // Accepting it is fine -- the geometry is still in bounds -- but every read
+    // must stay inside the image, which is what the sanitizer build proves.
+    if (opened) {
+      for (auto it = opened->begin(); it != opened->end(); ++it) {
+        (void)it.address();
+        (void)opened->uint(it, f);
+      }
+    }
+  }
+}
+
 void test_directory_is_narrowed() {
   {  // Dense: the partition is implicit, so it costs nothing at all.
     auto [sink, report] = build_remap_case(true, 60, 100, 5);
@@ -2083,6 +2617,13 @@ int main() {
   run("odd narrow widths", test_odd_narrow_widths);
   run("span overload on narrow images", test_span_overload_on_narrow_images);
   run("wide address corruption", test_wide_address_corruption);
+  run("narrow low-order trim", test_narrow_low_order_trim);
+  run("wide partition trim", test_wide_partition_trim);
+  run("trim probe edges", test_trim_probe_edges);
+  run("trim zero width", test_trim_zero_width);
+  run("trim costs nothing when uniform", test_trim_costs_nothing_when_uniform);
+  run("trim with remap", test_trim_with_remap);
+  run("trim corruption", test_trim_corruption);
   run("directory is narrowed", test_directory_is_narrowed);
   run("remap corruption", test_remap_corruption);
   run("rejects bad images", test_rejects_bad_images);

@@ -41,7 +41,11 @@ inline constexpr char magic[8] = {'M', 'M', 'P', 'A', 'C', 'K', '0', '1'};
 /// rather than a compatible extension.
 /// 3 packed the directory at data-derived widths instead of a fixed 32-byte
 /// struct.
-inline constexpr std::uint32_t format_version = 3;
+/// 4 gave each partition its own address range within the address field. The
+/// two new schema_header fields moved the descriptor blob that follows it, so a
+/// version-3 reader would misparse the schema outright rather than misread
+/// records -- but a bump is the honest way to say so either way.
+inline constexpr std::uint32_t format_version = 4;
 
 namespace flags {
 /// Directory slot i describes partition i, including empty ones: O(1) select.
@@ -88,6 +92,12 @@ struct dir_entry {
   std::uint64_t count;         ///< number of records
   std::uint32_t schema_id;     ///< 0 = global reference; else local reference width
   std::uint32_t remap_count;   ///< entries in the remap table; 0 when schema_id == 0
+  /// The stretch of the address field this partition actually stores. Every
+  /// address here is zero outside [address_skip, address_skip + address_width),
+  /// so those bytes are trimmed and re-supplied as zeros on read. See the
+  /// trimming rule in table.hpp.
+  std::uint32_t address_width;
+  std::uint32_t address_skip;
 };
 
 /// How a directory slot is packed on disk.
@@ -107,12 +117,16 @@ struct dir_layout {
   unsigned count_width = 0;
   unsigned schema_width = 0;  ///< 0 or 1; 0 when no partition is remapped
   unsigned remap_width = 0;   ///< 0 when no partition is remapped
+  unsigned addr_width = 0;    ///< 0 when every partition stores the full address
+  unsigned skip_width = 0;    ///< 0 when no partition trims a prefix
 
   unsigned partition_at = 0;
   unsigned offset_at = 0;
   unsigned count_at = 0;
   unsigned schema_at = 0;
   unsigned remap_at = 0;
+  unsigned addr_at = 0;
+  unsigned skip_at = 0;
   unsigned stride = 0;
 
   // Masks for reading a field as one wide load rather than a width switch.
@@ -123,17 +137,22 @@ struct dir_layout {
   std::uint64_t count_mask = 0;
   std::uint64_t schema_mask = 0;
   std::uint64_t remap_mask = 0;
+  std::uint64_t addr_mask = 0;
+  std::uint64_t skip_mask = 0;
 };
 
 [[nodiscard]] inline dir_layout make_dir_layout(unsigned partition_width, unsigned offset_width,
                                                 unsigned count_width, unsigned schema_width,
-                                                unsigned remap_width) noexcept {
+                                                unsigned remap_width, unsigned addr_width,
+                                                unsigned skip_width) noexcept {
   dir_layout out;
   out.partition_width = partition_width;
   out.offset_width = offset_width;
   out.count_width = count_width;
   out.schema_width = schema_width;
   out.remap_width = remap_width;
+  out.addr_width = addr_width;
+  out.skip_width = skip_width;
 
   unsigned at = 0;
   out.partition_at = at;
@@ -146,6 +165,10 @@ struct dir_layout {
   at += schema_width;
   out.remap_at = at;
   at += remap_width;
+  out.addr_at = at;
+  at += addr_width;
+  out.skip_at = at;
+  at += skip_width;
   out.stride = at;
 
   out.partition_mask = detail::mask_for_width(partition_width);
@@ -153,6 +176,8 @@ struct dir_layout {
   out.count_mask = detail::mask_for_width(count_width);
   out.schema_mask = detail::mask_for_width(schema_width);
   out.remap_mask = detail::mask_for_width(remap_width);
+  out.addr_mask = detail::mask_for_width(addr_width);
+  out.skip_mask = detail::mask_for_width(skip_width);
   return out;
 }
 
@@ -169,12 +194,20 @@ inline void encode_dir_entry(std::byte* out, const dir_layout& layout, const dir
   if (layout.remap_width) {
     detail::store_uint(out + layout.remap_at, layout.remap_width, d.remap_count);
   }
+  if (layout.addr_width) {
+    detail::store_uint(out + layout.addr_at, layout.addr_width, d.address_width);
+  }
+  if (layout.skip_width) {
+    detail::store_uint(out + layout.skip_at, layout.skip_width, d.address_skip);
+  }
 }
 
 /// `index` supplies the partition when the directory is dense and therefore
-/// does not store it.
+/// does not store it. `full_address_width` supplies the address width when no
+/// partition trims anything and the field is therefore absent.
 [[nodiscard]] inline dir_entry decode_dir_entry(const std::byte* in, const dir_layout& layout,
-                                                std::uint64_t index) noexcept {
+                                                std::uint64_t index,
+                                                unsigned full_address_width = 0) noexcept {
   dir_entry d{};
   d.partition = layout.partition_width
                     ? detail::load_uint(in + layout.partition_at, layout.partition_width)
@@ -188,6 +221,14 @@ inline void encode_dir_entry(std::byte* out, const dir_layout& layout, const dir
   d.remap_count =
       layout.remap_width
           ? static_cast<std::uint32_t>(detail::load_uint(in + layout.remap_at, layout.remap_width))
+          : 0;
+  d.address_width =
+      layout.addr_width
+          ? static_cast<std::uint32_t>(detail::load_uint(in + layout.addr_at, layout.addr_width))
+          : full_address_width;
+  d.address_skip =
+      layout.skip_width
+          ? static_cast<std::uint32_t>(detail::load_uint(in + layout.skip_at, layout.skip_width))
           : 0;
   return d;
 }
